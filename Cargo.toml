@@ -1,0 +1,17 @@
+[package]
+name = "first_display_project_spi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+linux-embedded-hal = { version = "0.4.0", features = ["gpio_cdev", "spi"] }
+embedded-hal = "1.0.0"
+embedded-graphics = "0.8.1"
+image = "0.25.6"
+mipidsi = "0.9.0"
+gpio-cdev = "0.4"
+display-interface = "0.5.0"
+embedded-hal-bus = "0.3.0"
+linuxfb = "0.3.1"
+ssd1306 = "0.10.0"
+
