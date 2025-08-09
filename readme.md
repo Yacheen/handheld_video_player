@@ -18,5 +18,13 @@ pi info:
     connect spi, (where dc= gpio22, and reset = gpio27, led = 5 I think) and two i2c devices
     create systemctl service to run on boot that'll execute binary built from above
 
+buttons info:
+
+    make sure u got systemctl service that does pinctrl set bottom left 4 ip, pu
+    sel - gpio19
+    esc - gpio26
+    up - gpio13
+    down - gpio6
+    
 
 
