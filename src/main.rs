@@ -16,6 +16,7 @@ use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd13
 use tokio::{sync::mpsc, time::{sleep, Duration, Instant}};
 use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
+use std::process::Command;
 // const WIDTH: usize = 320;
 // const HEIGHT: usize = 240;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
@@ -92,6 +93,13 @@ struct PlayingSomethingData {
 #[tokio::main]
 async fn main() -> ! {
     println!("Hello, world!");
+    let output = Command::new("../setup_gpios.sh")
+        .output()
+        .expect("Failed to execute setup gpio pullup inputs")
+    ;
+    println!("I MADE IT HERE");
+    thread::sleep(Duration::from_secs(2));
+
     // gpio setup
     let chip_path = "/dev/gpiochip0";
     let mut chip = Chip::new(chip_path).unwrap();
