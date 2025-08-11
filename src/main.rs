@@ -97,7 +97,6 @@ async fn main() -> ! {
         .output()
         .expect("Failed to execute setup gpio pullup inputs")
     ;
-    println!("I MADE IT HERE");
     thread::sleep(Duration::from_secs(2));
 
     // gpio setup
@@ -190,6 +189,24 @@ async fn main() -> ! {
     tokio::spawn(button_task(chip_path, 13, tx.clone(), ButtonEvent::Up));
     // down
     tokio::spawn(button_task(chip_path, 6, tx.clone(), ButtonEvent::Down));
+
+    let current_dir = std::env::current_dir().unwrap();
+    let current_dir_as_str= current_dir
+        .iter()
+        .last()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    
+    
+
+
+    i2c_screen1_display.clear_buffer();
+    i2c_screen1_display.flush().unwrap();
+    Text::with_baseline(current_dir_as_str, Point::zero(), text_style, Baseline::Top)
+        .draw(&mut i2c_screen1_display)
+        .unwrap();
+    i2c_screen1_display.flush().unwrap();
 
     
     // Start program and listen for button presses
@@ -332,5 +349,33 @@ async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<But
             }
         }
         sleep(Duration::from_millis(10)).await;
+    }
+}
+
+
+// I only care about removing pixels at where they previously were at.
+
+// I can draw twice,
+// once being where they previously were with dark pixels, then 
+// once for where the new ones shall be.
+// can also add 5-frame animation in the direction based on where navigating to (last)
+
+// remove exact pixels at certain area
+fn clear_from_screen() {
+}
+
+// add pixels at certain area with text and type
+fn print_to_screen(text_type: &str, point: Point, scroll: bool) {
+    match text_type {
+        "small" => {
+
+        }
+        "medium" => {
+
+        }
+        "large" => {
+
+        }
+        _ => ()
     }
 }
