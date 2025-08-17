@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use embedded_graphics::{
     mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -92,8 +93,9 @@ struct PlayingSomethingData {
 
 #[tokio::main]
 async fn main() -> ! {
-    println!("Hello, world!");
-    let output = Command::new("../setup_gpios.sh")
+    // set current directory to home
+    std::env::set_current_dir("/home/yassin/").unwrap();
+    let output = Command::new("./setup_gpios.sh")
         .output()
         .expect("Failed to execute setup gpio pullup inputs")
     ;
@@ -166,20 +168,6 @@ async fn main() -> ! {
     // issues could possibly arrive being a buffer of 16 only idk tho
     let (tx, mut rx) = mpsc::channel(16);
 
-    let navigating_data = NavigatingData {
-        files: Vec::new(),
-        current_dir: String::new(),
-        current_file_hovered: String::new(),
-    };
-    let prev_navigating_data = NavigatingData {
-        files: Vec::new(),
-        current_dir: String::new(),
-        current_file_hovered: String::new(),
-    };
-    let mut state = State {
-        current_state: DisplayState::Navigating(navigating_data),
-        previous_state: DisplayState::Navigating(prev_navigating_data),
-    };
 
     // select
     tokio::spawn(button_task(chip_path, 19, tx.clone(), ButtonEvent::Select));
@@ -190,6 +178,7 @@ async fn main() -> ! {
     // down
     tokio::spawn(button_task(chip_path, 6, tx.clone(), ButtonEvent::Down));
 
+    // print current dir on i2cdisplay1
     let current_dir = std::env::current_dir().unwrap();
     let current_dir_as_str= current_dir
         .iter()
@@ -197,9 +186,6 @@ async fn main() -> ! {
         .unwrap()
         .to_str()
         .unwrap();
-    
-    
-
 
     i2c_screen1_display.clear_buffer();
     i2c_screen1_display.flush().unwrap();
@@ -208,6 +194,32 @@ async fn main() -> ! {
         .unwrap();
     i2c_screen1_display.flush().unwrap();
 
+    let navigating_data = NavigatingData {
+        files: Vec::new(),
+        current_dir: current_dir_as_str.to_owned(),
+        current_file_hovered: String::new(),
+    };
+    let prev_navigating_data = NavigatingData {
+        files: Vec::new(),
+        current_dir: current_dir_as_str.to_owned(),
+        current_file_hovered: String::new(),
+    };
+    let mut state = State {
+        current_state: DisplayState::Navigating(navigating_data),
+        previous_state: DisplayState::Navigating(prev_navigating_data),
+    };
+    // print video data on i2cdisplay2 (curretly timestamp & volume)
+
+    // draw initial ui before awaiting button responses
+
+    // http request for temp here in future()
+    // count num of files (including dirs) in current dir
+    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
+    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
+    let current_local_time: DateTime<Local> = Local::now();
+    let formatted_local_time = current_local_time.format("%H:%M");
+    println!("file count!: {}", file_count);
+    println!("formatted local time: {:?}", formatted_local_time);
     
     // Start program and listen for button presses
     while let Some(event) = rx.recv().await {
@@ -234,7 +246,7 @@ async fn main() -> ! {
                             // 24 fps
                             let frame_delay = Duration::from_millis(42);
                             // open rgb565 file
-                            let mut dball = File::open("dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
+                            let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
                             let mut frame = vec![0u8; frame_bytes];
 
                             while let Ok(()) = dball.read_exact(&mut frame) {
@@ -353,6 +365,18 @@ async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<But
 }
 
 
+
+// draw when?
+// > draw current directory on top of big screen
+// > draw current selected file, and next/prev file above and below.
+// > using prevstate, if navigating, draw same location of prev text with color of background, then
+//      draw new state
+//      - if going from video to confirm, or navigating to confirm, 
+// > on selection of something else,
+// > draw state on small screen 1
+// > draw video data on small screen 2 (vol, duration, anything else? playing?)
+// > draw above and below files/folders
+// 
 // I only care about removing pixels at where they previously were at.
 
 // I can draw twice,
