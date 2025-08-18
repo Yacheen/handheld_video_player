@@ -1,25 +1,23 @@
 use chrono::{DateTime, Local};
 use embedded_graphics::{
-    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyleBuilder},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
+    image::{Image, ImageRaw}, mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, text::{Baseline, Text}, transform
 };
 use embedded_hal::digital::{InputPin, OutputPin};
-use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
+use image::imageops::rotate90;
+use linux_embedded_hal::{gpio_cdev::{AsyncLineEventHandle, Chip, EventRequestFlags, EventType, LineRequestFlags}, spidev::{SpiModeFlags, SpidevOptions}, Delay};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
+use mipidsi::{interface::SpiInterface, models::ILI9341Rgb565, options::{ColorInversion, Orientation}};
 use std::{collections::HashMap, io::prelude::*, sync::{Arc, Mutex}};
 use std::fs::File;
 use std::thread;
-use linuxfb::Framebuffer;
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
 use tokio::{sync::mpsc, time::{sleep, Duration, Instant}};
 use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
-// const WIDTH: usize = 320;
-// const HEIGHT: usize = 240;
+const WIDTH: usize = 240;
+const HEIGHT: usize = 320;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
 const SSD1306_SLAVE_ADDR: u16 = 0x3c;
 
@@ -52,6 +50,8 @@ struct PlayingSomethingData {
     timestamp: u64,
     volume: u8,
 }
+
+static mut INTERFACE_BUFFER: [u8; 512] = [0_u8; 512];
 // when navigating:
 // show directory on top, file on bottom small screens
 
@@ -142,27 +142,37 @@ async fn main() -> ! {
     i2c_screen2_display.flush().unwrap();
 
 
-    // delay init
-    // let mut delay = Delay {};
-    //
     // // spi0 tft ili9341 display------------------------------------------------------
     // // dc and rst
-    // let mut dc = CdevPin::new(chip.get_line(27).unwrap().request(LineRequestFlags::OUTPUT, 0, "dc").unwrap()).unwrap();
-    // let mut rst = CdevPin::new(chip.get_line(22).unwrap().request(LineRequestFlags::OUTPUT, 0, "rst").unwrap()).unwrap();
+    let mut dc = CdevPin::new(chip.get_line(22).unwrap().request(LineRequestFlags::OUTPUT, 0, "dc").unwrap()).unwrap();
+    let mut rst = CdevPin::new(chip.get_line(27).unwrap().request(LineRequestFlags::OUTPUT, 0, "rst").unwrap()).unwrap();
 
-    //spi pins
+
+    let mut delay = Delay {};
+    let mut spi_device = linux_embedded_hal::SpidevDevice::open("/dev/spidev0.0").unwrap();
+    let spi_device_options = SpidevOptions::new()
+        .bits_per_word(8)
+        .max_speed_hz(30_000_000)
+        .mode(SpiModeFlags::SPI_MODE_0)
+        .build();
+    spi_device.configure(&spi_device_options).unwrap();
+    
+
+    let buffer: &'static mut [u8; 512] = Box::leak(Box::new([0u8; 512]));
+    let di = SpiInterface::new(spi_device, dc, buffer);
+
+    let mut display = mipidsi::Builder::new(ILI9341Rgb565, di)
+        .reset_pin(rst)
+        .init(&mut delay).unwrap();
+    display.clear(Rgb565::BLACK).unwrap();
+    let display = Arc::new(Mutex::new(display));
+
+    // spi pins
     // let sclk = CdevPin::new(chip.get_line(11).unwrap().request(LineRequestFlags::OUTPUT, 0, "sclk").unwrap()).unwrap();
     // let mosi = CdevPin::new(chip.get_line(10).unwrap().request(LineRequestFlags::OUTPUT, 0, "mosi").unwrap()).unwrap();
     // let miso = CdevPin::new(chip.get_line(9).unwrap().request(LineRequestFlags::OUTPUT, 0, "miso").unwrap()).unwrap();
     let mut backlight = CdevPin::new(chip.get_line(5).unwrap().request(LineRequestFlags::OUTPUT, 1, "bl").unwrap()).unwrap();
     backlight.set_high().unwrap();
-
-    // open framebuffer device, get properties
-    let fb = Arc::new(Mutex::new(Framebuffer::new("/dev/fb1").unwrap()));
-    let (width, height) = fb.lock().unwrap().get_size();
-    let bpp = fb.lock().unwrap().get_bytes_per_pixel() as usize;
-    let (vx, vy) = fb.lock().unwrap().get_virtual_size();
-    eprintln!("fb: {}×{}, virtual {}×{}", width, height, vx, vy);
 
     // buttons
     // issues could possibly arrive being a buffer of 16 only idk tho
@@ -237,22 +247,26 @@ async fn main() -> ! {
                         // go into dir or show confirmmediaselection
                         println!("Clicked Select!");
 
-                        let fb2 = fb.clone();
+                        let display = display.clone();
                         tokio::spawn(async move {
-                            // map framebuffer mem once
-                            let mut fb_mem = fb2.lock().unwrap().map().unwrap();
-                            // bytes per file & and fps
-                            let frame_bytes = width as usize * height as usize * bpp;
-                            // 24 fps
+                            let display2 = display.clone();
+                            let frame_bytes = 240 as usize * 320 as usize * 2;
                             let frame_delay = Duration::from_millis(42);
                             // open rgb565 file
-                            let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
+                            let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_be.raw").unwrap();
                             let mut frame = vec![0u8; frame_bytes];
 
                             while let Ok(()) = dball.read_exact(&mut frame) {
                                 let started = Instant::now();
-                                fb_mem[..frame_bytes].copy_from_slice(&frame);
 
+                                let raw_frame: ImageRaw<Rgb565> = ImageRaw::<Rgb565>::new(&frame, WIDTH as u32);
+                                let frame = Image::new(&raw_frame, Point::zero());
+                                // lock 
+                                {
+                                    println!("drawing!");
+                                    let mut disp = display2.lock().unwrap();
+                                    frame.draw(&mut *disp).unwrap();
+                                }
                                 let elapsed = started.elapsed();
                                 if elapsed < frame_delay {
                                     thread::sleep(frame_delay - elapsed);
