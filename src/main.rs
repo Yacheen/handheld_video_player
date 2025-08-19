@@ -1,9 +1,6 @@
 use chrono::{DateTime, Local};
 use embedded_graphics::{
-    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyleBuilder},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
+    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyle, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle}, text::{Baseline, Text}
 };
 use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
@@ -41,6 +38,8 @@ enum DisplayState {
 struct State {
     current_state: DisplayState,
     previous_state: DisplayState,
+    nav_state: NavigatingData,
+    video_state: PlayingSomethingData
 }
 struct NavigatingData {
     current_dir: String,
@@ -129,56 +128,16 @@ async fn main() -> ! {
         .font(&FONT_8X13)
         .text_color(BinaryColor::On)
         .build();
-
-    Text::with_baseline("Hello,", Point::zero(), text_style, Baseline::Top)
-        .draw(&mut i2c_screen1_display)
-        .unwrap();
-    i2c_screen1_display.flush().unwrap();
     
-
-    Text::with_baseline("Yassin", Point::zero(), text_style, Baseline::Top)
+    Text::with_baseline("Hello, Yassin.", Point::zero(), text_style, Baseline::Top)
         .draw(&mut i2c_screen2_display)
         .unwrap();
     i2c_screen2_display.flush().unwrap();
 
-
-    // delay init
-    // let mut delay = Delay {};
-    //
-    // // spi0 tft ili9341 display------------------------------------------------------
-    // // dc and rst
-    // let mut dc = CdevPin::new(chip.get_line(27).unwrap().request(LineRequestFlags::OUTPUT, 0, "dc").unwrap()).unwrap();
-    // let mut rst = CdevPin::new(chip.get_line(22).unwrap().request(LineRequestFlags::OUTPUT, 0, "rst").unwrap()).unwrap();
-
-    //spi pins
-    // let sclk = CdevPin::new(chip.get_line(11).unwrap().request(LineRequestFlags::OUTPUT, 0, "sclk").unwrap()).unwrap();
-    // let mosi = CdevPin::new(chip.get_line(10).unwrap().request(LineRequestFlags::OUTPUT, 0, "mosi").unwrap()).unwrap();
-    // let miso = CdevPin::new(chip.get_line(9).unwrap().request(LineRequestFlags::OUTPUT, 0, "miso").unwrap()).unwrap();
     let mut backlight = CdevPin::new(chip.get_line(5).unwrap().request(LineRequestFlags::OUTPUT, 1, "bl").unwrap()).unwrap();
     backlight.set_high().unwrap();
 
-    // open framebuffer device, get properties
-    let fb = Arc::new(Mutex::new(Framebuffer::new("/dev/fb1").unwrap()));
-    let (width, height) = fb.lock().unwrap().get_size();
-    let bpp = fb.lock().unwrap().get_bytes_per_pixel() as usize;
-    let (vx, vy) = fb.lock().unwrap().get_virtual_size();
-    eprintln!("fb: {}×{}, virtual {}×{}", width, height, vx, vy);
-
-    // buttons
-    // issues could possibly arrive being a buffer of 16 only idk tho
-    let (tx, mut rx) = mpsc::channel(16);
-
-
-    // select
-    tokio::spawn(button_task(chip_path, 19, tx.clone(), ButtonEvent::Select));
-    // escape
-    tokio::spawn(button_task(chip_path, 26, tx.clone(), ButtonEvent::Escape));
-    // up
-    tokio::spawn(button_task(chip_path, 13, tx.clone(), ButtonEvent::Up));
-    // down
-    tokio::spawn(button_task(chip_path, 6, tx.clone(), ButtonEvent::Down));
-
-    // print current dir on i2cdisplay1
+    // STATE INITIALIZATION----------------------------------------------------------------------------------------------------
     let current_dir = std::env::current_dir().unwrap();
     let current_dir_as_str= current_dir
         .iter()
@@ -187,6 +146,60 @@ async fn main() -> ! {
         .to_str()
         .unwrap();
 
+    // top ui states
+    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
+    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
+    let current_local_time: DateTime<Local> = Local::now();
+    let formatted_local_time = current_local_time.format("%H:%M");
+    println!("file count!: {}", file_count);
+    println!("formatted local time: {:?}", formatted_local_time);
+
+    let mut state = State {
+        current_state: DisplayState::Navigating(NavigatingData {
+            files: Vec::new(),
+            current_dir: current_dir_as_str.to_owned(),
+            current_file_hovered: String::new(),
+        }),
+        previous_state: DisplayState::Navigating(NavigatingData {
+            files: Vec::new(),
+            current_dir: current_dir_as_str.to_owned(),
+            current_file_hovered: String::new(),
+        }),
+        nav_state: NavigatingData {
+            files: Vec::new(),
+            current_dir: current_dir_as_str.to_owned(),
+            current_file_hovered: String::new(),
+        },
+        video_state: PlayingSomethingData {
+            paused: true,
+            volume: 0,
+            timestamp: 0,
+        }
+    };
+
+    // buttons channels and tasks-------------------------------------------------------------
+    // btn channel
+    let (btn_tx, mut btn_rx) = mpsc::channel(32);
+    // draw channel
+    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
+    // video/music task command channel (pause, resume, stop)
+    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
+
+    // select
+    tokio::spawn(button_task(chip_path, 19, btn_tx.clone(), ButtonEvent::Select));
+    // escape
+    tokio::spawn(button_task(chip_path, 26, btn_tx.clone(), ButtonEvent::Escape));
+    // up
+    tokio::spawn(button_task(chip_path, 13, btn_tx.clone(), ButtonEvent::Up));
+    // down
+    tokio::spawn(button_task(chip_path, 6, btn_tx.clone(), ButtonEvent::Down));
+
+    // draw task - will draw whatever until end of program
+    tokio::spawn(start_drawing_task(draw_rx));
+
+    // wait for start_drawing_task to be ready
+    std::thread::sleep(Duration::from_millis(500));
+
     i2c_screen1_display.clear_buffer();
     i2c_screen1_display.flush().unwrap();
     Text::with_baseline(current_dir_as_str, Point::zero(), text_style, Baseline::Top)
@@ -194,38 +207,41 @@ async fn main() -> ! {
         .unwrap();
     i2c_screen1_display.flush().unwrap();
 
-    let navigating_data = NavigatingData {
-        files: Vec::new(),
-        current_dir: current_dir_as_str.to_owned(),
-        current_file_hovered: String::new(),
-    };
-    let prev_navigating_data = NavigatingData {
-        files: Vec::new(),
-        current_dir: current_dir_as_str.to_owned(),
-        current_file_hovered: String::new(),
-    };
-    let mut state = State {
-        current_state: DisplayState::Navigating(navigating_data),
-        previous_state: DisplayState::Navigating(prev_navigating_data),
-    };
-    // print video data on i2cdisplay2 (curretly timestamp & volume)
+    // initialize nav ui. the rest will be handled below on button presses based on states
+    let mut drawings = Vec::new();
+    // top meta
+    drawings.push(
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(Point::new(10, 10), Size::new(300, 40)),
+            Size::new(10, 10),
+        )
+    );
+    // selection carousel
+    {
+        drawings.append(
+            &mut vec![
+                RoundedRectangle::with_equal_corners(
+                    Rectangle::new(Point::new(40, 90), Size::new(270, 40)),
+                    Size::new(10, 10),
+                ),
+                RoundedRectangle::with_equal_corners(
+                    Rectangle::new(Point::new(40, 140), Size::new(270, 40)),
+                    Size::new(10, 10),
+                ),
+                RoundedRectangle::with_equal_corners(
+                    Rectangle::new(Point::new(40, 190), Size::new(270, 40)),
+                    Size::new(10, 10),
+                ),
+            ]
+        );
+    }
 
-    // draw initial ui before awaiting button responses
-
-    // http request for temp here in future()
-    // count num of files (including dirs) in current dir
-    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
-    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
-    let current_local_time: DateTime<Local> = Local::now();
-    let formatted_local_time = current_local_time.format("%H:%M");
-    println!("file count!: {}", file_count);
-    println!("formatted local time: {:?}", formatted_local_time);
+    draw_tx.send(DrawCommand::ClearScreen).await.unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    draw_tx.send(DrawCommand::NavigatingBackground { drawings }).await.unwrap();
     
-    // Start program and listen for button presses
-    while let Some(event) = rx.recv().await {
-        // check what state ur currently in
-        // also check what buttonevent happened
-        // finally, based on the previous state, do an action
+    // listen for btn presses
+    while let Some(event) = btn_rx.recv().await {
         match &mut state.current_state {
             DisplayState::Navigating(navigating_data) => {
                 match event {
@@ -237,28 +253,28 @@ async fn main() -> ! {
                         // go into dir or show confirmmediaselection
                         println!("Clicked Select!");
 
-                        let fb2 = fb.clone();
-                        tokio::spawn(async move {
-                            // map framebuffer mem once
-                            let mut fb_mem = fb2.lock().unwrap().map().unwrap();
-                            // bytes per file & and fps
-                            let frame_bytes = width as usize * height as usize * bpp;
-                            // 24 fps
-                            let frame_delay = Duration::from_millis(42);
-                            // open rgb565 file
-                            let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
-                            let mut frame = vec![0u8; frame_bytes];
-
-                            while let Ok(()) = dball.read_exact(&mut frame) {
-                                let started = Instant::now();
-                                fb_mem[..frame_bytes].copy_from_slice(&frame);
-
-                                let elapsed = started.elapsed();
-                                if elapsed < frame_delay {
-                                    thread::sleep(frame_delay - elapsed);
-                                }
-                            }
-                        });
+                        // let fb2 = fb.clone();
+                        // tokio::spawn(async move {
+                        //     // map framebuffer mem once
+                        //     let mut fb_mem = fb2.lock().unwrap().map().unwrap();
+                        //     // bytes per file & and fps
+                        //     let frame_bytes = width as usize * height as usize * bpp;
+                        //     // 24 fps
+                        //     let frame_delay = Duration::from_millis(42);
+                        //     // open rgb565 file
+                        //     let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
+                        //     let mut frame = vec![0u8; frame_bytes];
+                        //
+                        //     while let Ok(()) = dball.read_exact(&mut frame) {
+                        //         let started = Instant::now();
+                        //         fb_mem[..frame_bytes].copy_from_slice(&frame);
+                        //
+                        //         let elapsed = started.elapsed();
+                        //         if elapsed < frame_delay {
+                        //             thread::sleep(frame_delay - elapsed);
+                        //         }
+                        //     }
+                        // });
                     }
                     ButtonEvent::Up => {
                         // goto prev file
@@ -277,6 +293,9 @@ async fn main() -> ! {
                     }
                     ButtonEvent::Select => {
                         // go back or goto playing based on state
+                        if *hover_state == true {
+                            println!("hello world");
+                        }
                     }
                     ButtonEvent::Up => {
                         // invert state
@@ -365,41 +384,204 @@ async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<But
 }
 
 
-
-// draw when?
-// > draw current directory on top of big screen
-// > draw current selected file, and next/prev file above and below.
-// > using prevstate, if navigating, draw same location of prev text with color of background, then
-//      draw new state
-//      - if going from video to confirm, or navigating to confirm, 
-// > on selection of something else,
-// > draw state on small screen 1
-// > draw video data on small screen 2 (vol, duration, anything else? playing?)
-// > draw above and below files/folders
-// 
-// I only care about removing pixels at where they previously were at.
-
-// I can draw twice,
-// once being where they previously were with dark pixels, then 
-// once for where the new ones shall be.
-// can also add 5-frame animation in the direction based on where navigating to (last)
-
-// remove exact pixels at certain area
-fn clear_from_screen() {
+// EVERYTHING HERE IS RELATED TO DRAWING ONLY, NO LOGIC
+//
+// drawtarget impl for framebufferdisplay
+struct FramebufferDisplay<'a> {
+    buf: &'a mut [u8],
+    width: usize,
+    height: usize,
 }
 
-// add pixels at certain area with text and type
-fn print_to_screen(text_type: &str, point: Point, scroll: bool) {
-    match text_type {
-        "small" => {
-
-        }
-        "medium" => {
-
-        }
-        "large" => {
-
-        }
-        _ => ()
+impl<'a> OriginDimensions for FramebufferDisplay<'a> {
+    fn size(&self) -> Size {
+        Size::new(self.width as u32, self.height as u32)
     }
 }
+impl <'a> DrawTarget for FramebufferDisplay<'a> {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+        I: IntoIterator<Item = Pixel<Self::Color>> 
+    {
+        for Pixel(coord, color) in pixels {
+            if coord.x >= 0 && coord.x < self.width as i32 && coord.y >= 0 && coord.y < self.height as i32 {
+                // 2 bytes per pixel (rgb565)
+                let idx = (coord.y as usize * self.width + coord.x as usize) * 2;
+                let mut value = color.into_storage();
+                // rgb => bgr
+                let red = (value >> 11) & 0x1F;
+                let green = (value >> 5) & 0x3F;
+                let blue = value & 0x1F;
+                let swapped = (blue << 11) | (green << 5) | red;
+
+                let rgb = swapped.swap_bytes().to_be_bytes();
+                self.buf[idx] = rgb[0];
+                self.buf[idx + 1] = rgb[1];
+            }
+        }
+        Ok(())
+    }
+}
+
+enum DrawCommand {
+    // happens after selecting or exiting
+    ConfirmingBackground {
+        message: String,
+        options: Vec<String>
+    },
+    // draw rect on top, 3 rects in middle/bottom for file icon, and file name after state change
+    // to navigating
+    NavigatingBackground {
+        drawings: Vec<RoundedRectangle>,
+    },
+    // text only happens when navigatingbackground has been sent and state has changed to
+    // navigating
+    Text {
+        content: String,
+        position: Point
+    },
+    RawFrame {
+        data: Vec<u8>,
+    },
+    ClearScreen
+}
+enum ControlCommand {
+    Stop,
+    Pause,
+    Resume,
+}
+// light background, dark text
+fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Vec<String>) {
+    clear_screen(fb);
+    // wipe screen first TODO()
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_width(3)
+        .stroke_color(Rgb565::BLACK)
+        .fill_color(Rgb565::CSS_NAVAJO_WHITE)
+        .build();
+
+    Rectangle::new(Point::new(10, height as i32 / 2), Size::new(40, 20))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+fn undraw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_width(3)
+        .stroke_color(Rgb565::BLACK)
+        .fill_color(Rgb565::BLACK)
+        .build();
+
+    Rectangle::new(Point::new(10, height as i32 / 2), Size::new(40, 20))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+// top rect, and 3 middle rects spaced out by 10px
+fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec<RoundedRectangle>) {
+    // wipe screen first TODO()
+    clear_screen(fb);
+
+    // draw when transitioning to navigating state
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+
+    // top nav rectangle
+    let style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::CSS_NAVAJO_WHITE)
+        .build();
+
+    for drawing in drawings {
+        drawing
+            .into_styled(style)
+            .draw(&mut display)
+            .unwrap();
+    }
+}
+fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+    // undraw when leaving navigating state
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_width(3)
+        .stroke_color(Rgb565::WHITE)
+        .fill_color(Rgb565::WHITE)
+        .build();
+
+    Rectangle::new(point, Size::new(width as u32, height as u32))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+
+fn draw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::BLACK);
+
+    Text::with_baseline(msg, point, style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+}
+fn undraw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_NAVAJO_WHITE);
+
+    Text::with_baseline(msg, point, style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+}
+fn clear_screen(fb: &mut [u8]) {
+    let mut display = FramebufferDisplay { buf: fb, width: 320, height: 240 };
+
+    let style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::WHITE)
+        .build();
+    Rectangle::new(Point::zero(), Size::new(320, 240))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+
+fn draw_raw_frame(fb: &mut [u8], frame_data: &[u8]) {
+    fb.copy_from_slice(frame_data);
+}
+async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
+    tokio::task::spawn_blocking(move || {
+        let fb = Framebuffer::new("/dev/fb1").expect("Failed to open framebuffer");
+        let width = fb.get_size().0 as usize;
+        let height = fb.get_size().1 as usize;
+        let bpp = fb.get_bytes_per_pixel() as usize;
+        let frame_size = width * height * bpp;
+
+        let mut mapped = fb.map().expect("Failed to map framebuffer memory");
+        let mut playing_video = false;
+        let mut timestamp = 0;
+
+        while let Some(cmd) = draw_rx.blocking_recv() {
+            match cmd {
+                DrawCommand::Text { content, position } => {
+                    draw_text(&mut mapped, width, height, content.as_str(), position);
+                },
+                DrawCommand::ConfirmingBackground { message, options } => {
+                    draw_modal(&mut mapped, width, height, &message, options);
+                },
+                // current dir, 
+                DrawCommand::NavigatingBackground { drawings } => {
+                    draw_nav_background(&mut mapped, width, height, drawings);
+                }
+                DrawCommand::RawFrame { data } => {
+                    draw_raw_frame(&mut mapped, &data);
+                },
+                DrawCommand::ClearScreen => {
+                    clear_screen(&mut mapped);
+                }
+            }
+        }
+    });
+}
+
+
