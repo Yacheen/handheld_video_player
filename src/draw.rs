@@ -116,3 +116,11 @@ pub fn draw_cloud(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
         .draw(&mut display)
         .unwrap();
 }
+pub fn draw_camera(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_file(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_question_mark(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_music_note(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_playing(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_paused(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+pub fn draw_volume(fb: &mut [u8], width: usize, height: usize, top_left: Point) {}
+    

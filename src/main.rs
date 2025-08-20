@@ -47,7 +47,8 @@ struct State {
 }
 struct NavigatingData {
     current_dir: PathBuf,
-    current_index: u32,
+    current_index: usize,
+    file_count: usize,
     current_file_hovered: String,
 }
 struct PlayingSomethingData {
@@ -150,20 +151,30 @@ async fn main() -> ! {
         .to_str()
         .unwrap();
 
+    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
+    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
+    let current_local_time: DateTime<Local> = Local::now();
+    let formatted_local_time = current_local_time.format("%H:%M");
+    println!("file count!: {}", file_count);
+    println!("formatted local time: {:?}", formatted_local_time);
+
 
     let mut state = State {
         current_state: DisplayState::Navigating(NavigatingData {
             current_dir: current_dir.clone(),
+            file_count: file_count,
             current_index: 0,
             current_file_hovered: String::new(),
         }),
         previous_state: DisplayState::Navigating(NavigatingData {
             current_dir: current_dir.clone(),
+            file_count: file_count,
             current_index: 0,
             current_file_hovered: String::new(),
         }),
         nav_state: NavigatingData {
             current_dir: current_dir.clone(),
+            file_count: file_count,
             current_index: 0,
             current_file_hovered: String::new(),
         },
@@ -233,13 +244,6 @@ async fn main() -> ! {
         );
     }
 
-    // top ui states
-    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
-    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
-    let current_local_time: DateTime<Local> = Local::now();
-    let formatted_local_time = current_local_time.format("%H:%M");
-    println!("file count!: {}", file_count);
-    println!("formatted local time: {:?}", formatted_local_time);
 
 
     // Static drawings
@@ -247,21 +251,40 @@ async fn main() -> ! {
     std::thread::sleep(Duration::from_millis(500));
 
     draw_tx.send(DrawCommand::NavigatingBackground { drawings }).await.unwrap();
-    std::thread::sleep(Duration::from_millis(200));
 
     // Dynamic drawings (state)
 
     // current path, file_count, and current file navigated on (index of files of dir)
-    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir).to_str().unwrap().to_owned(), position: Point::new(20, 36) }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()).to_str().unwrap().to_owned(), position: Point::new(20, 36) }).await.unwrap();
     draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18) }).await.unwrap();
     // if index = 0, set top to nothing, set middle to 0, and bottom to 1
     // if index = 1, set top to 0, middle to 1, bottom to 2
     // if index = 2, set top to 1, middle to 2, bottom to 3
     // ...
     // if index = 18, set top to 17, middle to 18, bottom to nothing
-    let prev_file = 0;
-    let selected_file = 0;
-    let next_file = 0;
+
+    // draw indexes 0 and 1 to middle and bottom.
+    for (index, entry) in std::fs::read_dir(current_dir.to_owned()).unwrap().enumerate() {
+        let dir = entry.unwrap();
+        if index == 0 {
+            draw_tx.send(DrawCommand::Text { 
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 156) 
+            }).await.unwrap();
+
+        }
+        else if index == 1 {
+            draw_tx.send(DrawCommand::Text { 
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206) 
+            }).await.unwrap();
+        }
+        
+        //     Rectangle::new(Point::new(40, 140), Size::new(270, 40)),
+        //     Size::new(10, 10),
+        // ),
+        // RoundedRectangle::with_equal_corners(
+        //     Rectangle::new(Point::new(40, 190), Size::new(270, 40)),
+
+    }
 
 
     // texts
