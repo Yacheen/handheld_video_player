@@ -6,7 +6,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::{collections::HashMap, io::prelude::*, sync::{Arc, Mutex}};
+use std::{collections::HashMap, io::prelude::*, path::PathBuf, sync::{Arc, Mutex}};
 use std::fs::File;
 use std::thread;
 use linuxfb::Framebuffer;
@@ -15,10 +15,14 @@ use tokio::{sync::mpsc, time::{sleep, Duration, Instant}};
 use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
-// const WIDTH: usize = 320;
-// const HEIGHT: usize = 240;
+
+const WIDTH: usize = 320;
+const HEIGHT: usize = 240;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
 const SSD1306_SLAVE_ADDR: u16 = 0x3c;
+
+// mods
+mod draw;
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
 enum ButtonEvent {
@@ -42,8 +46,8 @@ struct State {
     video_state: PlayingSomethingData
 }
 struct NavigatingData {
-    current_dir: String,
-    files: Vec<String>,
+    current_dir: PathBuf,
+    current_index: u32,
     current_file_hovered: String,
 }
 struct PlayingSomethingData {
@@ -146,28 +150,21 @@ async fn main() -> ! {
         .to_str()
         .unwrap();
 
-    // top ui states
-    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
-    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
-    let current_local_time: DateTime<Local> = Local::now();
-    let formatted_local_time = current_local_time.format("%H:%M");
-    println!("file count!: {}", file_count);
-    println!("formatted local time: {:?}", formatted_local_time);
 
     let mut state = State {
         current_state: DisplayState::Navigating(NavigatingData {
-            files: Vec::new(),
-            current_dir: current_dir_as_str.to_owned(),
+            current_dir: current_dir.clone(),
+            current_index: 0,
             current_file_hovered: String::new(),
         }),
         previous_state: DisplayState::Navigating(NavigatingData {
-            files: Vec::new(),
-            current_dir: current_dir_as_str.to_owned(),
+            current_dir: current_dir.clone(),
+            current_index: 0,
             current_file_hovered: String::new(),
         }),
         nav_state: NavigatingData {
-            files: Vec::new(),
-            current_dir: current_dir_as_str.to_owned(),
+            current_dir: current_dir.clone(),
+            current_index: 0,
             current_file_hovered: String::new(),
         },
         video_state: PlayingSomethingData {
@@ -236,10 +233,40 @@ async fn main() -> ! {
         );
     }
 
+    // top ui states
+    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
+    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
+    let current_local_time: DateTime<Local> = Local::now();
+    let formatted_local_time = current_local_time.format("%H:%M");
+    println!("file count!: {}", file_count);
+    println!("formatted local time: {:?}", formatted_local_time);
+
+
+    // Static drawings
     draw_tx.send(DrawCommand::ClearScreen).await.unwrap();
     std::thread::sleep(Duration::from_millis(500));
+
     draw_tx.send(DrawCommand::NavigatingBackground { drawings }).await.unwrap();
-    
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Dynamic drawings (state)
+
+    // current path, file_count, and current file navigated on (index of files of dir)
+    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir).to_str().unwrap().to_owned(), position: Point::new(20, 36) }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18) }).await.unwrap();
+    // if index = 0, set top to nothing, set middle to 0, and bottom to 1
+    // if index = 1, set top to 0, middle to 1, bottom to 2
+    // if index = 2, set top to 1, middle to 2, bottom to 3
+    // ...
+    // if index = 18, set top to 17, middle to 18, bottom to nothing
+    let prev_file = 0;
+    let selected_file = 0;
+    let next_file = 0;
+
+
+    // texts
+    // current, previous, and next indexes's data.
+    // draw icons based on this iteration's filetype
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
         match &mut state.current_state {
@@ -252,29 +279,6 @@ async fn main() -> ! {
                     ButtonEvent::Select => {
                         // go into dir or show confirmmediaselection
                         println!("Clicked Select!");
-
-                        // let fb2 = fb.clone();
-                        // tokio::spawn(async move {
-                        //     // map framebuffer mem once
-                        //     let mut fb_mem = fb2.lock().unwrap().map().unwrap();
-                        //     // bytes per file & and fps
-                        //     let frame_bytes = width as usize * height as usize * bpp;
-                        //     // 24 fps
-                        //     let frame_delay = Duration::from_millis(42);
-                        //     // open rgb565 file
-                        //     let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
-                        //     let mut frame = vec![0u8; frame_bytes];
-                        //
-                        //     while let Ok(()) = dball.read_exact(&mut frame) {
-                        //         let started = Instant::now();
-                        //         fb_mem[..frame_bytes].copy_from_slice(&frame);
-                        //
-                        //         let elapsed = started.elapsed();
-                        //         if elapsed < frame_delay {
-                        //             thread::sleep(frame_delay - elapsed);
-                        //         }
-                        //     }
-                        // });
                     }
                     ButtonEvent::Up => {
                         // goto prev file
@@ -295,6 +299,25 @@ async fn main() -> ! {
                         // go back or goto playing based on state
                         if *hover_state == true {
                             println!("hello world");
+                            let draw_tx = draw_tx.clone();
+                            tokio::spawn(async move {
+                                let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                // 24 fps
+                                let frame_delay = Duration::from_millis(42);
+                                // open bgr565le file
+                                // change to whatever current file ur on in dir
+                                let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
+                                let mut frame = vec![0u8; frame_bytes];
+                                while let Ok(()) = dball.read_exact(&mut frame) {
+                                    // let started = Instant::now();
+                                    draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                    thread::sleep(frame_delay);
+                                    // let elapsed = started.elapsed();
+                                    // if elapsed < frame_delay {
+                                    //     thread::sleep(frame_delay - elapsed);
+                                    // }
+                                }
+                            });
                         }
                     }
                     ButtonEvent::Up => {
@@ -502,6 +525,11 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec
             .draw(&mut display)
             .unwrap();
     }
+    // add nav images on top. (folder, temperature, time icons)
+    draw::draw_folder(fb, width, height, Point::new(14, 10));
+    draw::draw_cloud(fb, width, height, Point::new(150, 10));
+    draw::draw_clock(fb, width, height, Point::new(220, 10));
+
 }
 fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
     // undraw when leaving navigating state
@@ -520,7 +548,7 @@ fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, 
 
 fn draw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
     let mut display = FramebufferDisplay { buf: fb, width, height };
-    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::BLACK);
+    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
 
     Text::with_baseline(msg, point, style, Baseline::Top)
         .draw(&mut display)
@@ -538,7 +566,7 @@ fn clear_screen(fb: &mut [u8]) {
     let mut display = FramebufferDisplay { buf: fb, width: 320, height: 240 };
 
     let style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::WHITE)
+        .fill_color(Rgb565::CSS_DARK_GRAY)
         .build();
     Rectangle::new(Point::zero(), Size::new(320, 240))
         .into_styled(style)
@@ -548,6 +576,14 @@ fn clear_screen(fb: &mut [u8]) {
 
 fn draw_raw_frame(fb: &mut [u8], frame_data: &[u8]) {
     fb.copy_from_slice(frame_data);
+}
+fn format_dir(current_dir: PathBuf) -> PathBuf {
+    if current_dir.to_str().unwrap() == "/home/yassin" {
+        return PathBuf::from("/home");
+    }
+    else {
+        return current_dir;
+    }
 }
 async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     tokio::task::spawn_blocking(move || {
