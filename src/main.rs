@@ -32,24 +32,25 @@ enum ButtonEvent {
     Escape,
 }
 enum DisplayState {
-    Navigating(NavigatingData),
-    PlayingSomething(PlayingSomethingData),
-    ConfirmingMediaSelection(bool),
-    ConfirmingMediaExit(bool),
-    UnrecoverableError(String),
-    ErrorMessage(String),
+    Navigating,
+    PlayingSomething,
+    ConfirmingMediaSelection,
+    ConfirmingMediaExit,
+    UnrecoverableError,
+    ErrorMessage,
 }
 struct State {
     current_state: DisplayState,
     previous_state: DisplayState,
     nav_state: NavigatingData,
-    video_state: PlayingSomethingData
+    video_state: PlayingSomethingData,
+    modal_state: (String, bool),
+    error_state: String,
 }
 struct NavigatingData {
     current_dir: PathBuf,
     current_index: usize,
     file_count: usize,
-    current_file_hovered: String,
 }
 struct PlayingSomethingData {
     paused: bool,
@@ -160,29 +161,20 @@ async fn main() -> ! {
 
 
     let mut state = State {
-        current_state: DisplayState::Navigating(NavigatingData {
-            current_dir: current_dir.clone(),
-            file_count: file_count,
-            current_index: 0,
-            current_file_hovered: String::new(),
-        }),
-        previous_state: DisplayState::Navigating(NavigatingData {
-            current_dir: current_dir.clone(),
-            file_count: file_count,
-            current_index: 0,
-            current_file_hovered: String::new(),
-        }),
+        current_state: DisplayState::Navigating,
+        previous_state: DisplayState::Navigating,
         nav_state: NavigatingData {
             current_dir: current_dir.clone(),
             file_count: file_count,
             current_index: 0,
-            current_file_hovered: String::new(),
         },
         video_state: PlayingSomethingData {
             paused: true,
             volume: 0,
             timestamp: 0,
-        }
+        },
+        modal_state: (String::new(), false),
+        error_state: String::new(),
     };
 
     // buttons channels and tasks-------------------------------------------------------------
@@ -277,15 +269,7 @@ async fn main() -> ! {
                 content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206) 
             }).await.unwrap();
         }
-        
-        //     Rectangle::new(Point::new(40, 140), Size::new(270, 40)),
-        //     Size::new(10, 10),
-        // ),
-        // RoundedRectangle::with_equal_corners(
-        //     Rectangle::new(Point::new(40, 190), Size::new(270, 40)),
-
     }
-
 
     // texts
     // current, previous, and next indexes's data.
@@ -293,7 +277,7 @@ async fn main() -> ! {
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
         match &mut state.current_state {
-            DisplayState::Navigating(navigating_data) => {
+            DisplayState::Navigating => {
                 match event {
                     ButtonEvent::Escape => {
                         // go up dir or show error msg
@@ -306,21 +290,29 @@ async fn main() -> ! {
                     ButtonEvent::Up => {
                         // goto prev file
                         println!("Clicked Up!");
+                        if state.nav_state.current_index != 0 {
+                            state.nav_state.current_index -= 1;
+                        }
                     }
                     ButtonEvent::Down => {
                         // goto next file
                         println!("Clicked Down!");
+                        // handle undraws, then draws based on new state
+
+                        if state.nav_state.current_index != (state.nav_state.file_count - 1) {
+                            state.nav_state.current_index += 1;
+                        }
                     }
                 }
             }
-            DisplayState::ConfirmingMediaSelection(hover_state) => {
+            DisplayState::ConfirmingMediaSelection => {
                 match event {
                     ButtonEvent::Escape => {
                         // go back to navigation
                     }
                     ButtonEvent::Select => {
                         // go back or goto playing based on state
-                        if *hover_state == true {
+                        if state.modal_state.1 == true {
                             println!("hello world");
                             let draw_tx = draw_tx.clone();
                             tokio::spawn(async move {
@@ -351,7 +343,7 @@ async fn main() -> ! {
                     }
                 }
             }
-            DisplayState::PlayingSomething(media_data) => {
+            DisplayState::PlayingSomething => {
                 match event {
                     ButtonEvent::Escape => {
                         // set confirmingmediaexit state
@@ -367,7 +359,7 @@ async fn main() -> ! {
                     }
                 }
             }
-            DisplayState::ConfirmingMediaExit(hover_state) => {
+            DisplayState::ConfirmingMediaExit => {
                 match event {
                     ButtonEvent::Escape => {
                         // set current state to prev state
@@ -384,7 +376,7 @@ async fn main() -> ! {
                     _ => ()
                 }
             }
-            DisplayState::ErrorMessage(msg) => {
+            DisplayState::ErrorMessage => {
                 match event {
                     ButtonEvent::Select => {
                         // back to previous_state
@@ -392,7 +384,7 @@ async fn main() -> ! {
                     _ => ()
                 }
             }
-            DisplayState::UnrecoverableError(msg) => {
+            DisplayState::UnrecoverableError => {
                 match event {
                     ButtonEvent::Select => {
                         // shut down device
@@ -553,6 +545,14 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec
     draw::draw_cloud(fb, width, height, Point::new(150, 10));
     draw::draw_clock(fb, width, height, Point::new(220, 10));
 
+    // THESE ALL SHOULD PROBABLY BE HAND DRAWN, GPT5 CANT DRAW ICONS FOR SHIT LOL
+    // draw::draw_camera(fb, width, height, Point::new(40, 100));
+    // draw::draw_file(fb, width, height, Point::new(65, 100));
+    // draw::draw_paused(fb, width, height, Point::new(80, 100));
+    // draw::draw_volume(fb, width, height, Point::new(105, 100));
+    // draw::draw_playing(fb, width, height, Point::new(130, 100));
+    // draw::draw_question_mark(fb, width, height, Point::new(155, 100));
+
 }
 fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
     // undraw when leaving navigating state
@@ -628,7 +628,7 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                 DrawCommand::ConfirmingBackground { message, options } => {
                     draw_modal(&mut mapped, width, height, &message, options);
                 },
-                // current dir, 
+        // current dir, 
                 DrawCommand::NavigatingBackground { drawings } => {
                     draw_nav_background(&mut mapped, width, height, drawings);
                 }
@@ -641,6 +641,34 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
             }
         }
     });
+}
+
+fn scroll_up(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
+    // can animate this in future
+
+    // undraw what is currently there
+    // read the current dir and skip to current index UNLESS if its 0 or at end of files
+    for (index, entry) in std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().enumerate() {
+        let dir = entry.unwrap();
+        if state.nav_state.current_index == 0 {
+
+        }
+        else if state.nav_state.current_index == (state.nav_state.file_count - 1) {
+
+        }
+        else {
+
+        }
+    }
+
+
+    // set new states
+
+    // draw what is next based on states
+
+}
+fn scroll_down(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
+
 }
 
 
