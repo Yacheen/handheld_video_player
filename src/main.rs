@@ -247,8 +247,8 @@ async fn main() -> ! {
     // Dynamic drawings (state)
 
     // current path, file_count, and current file navigated on (index of files of dir)
-    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()).to_str().unwrap().to_owned(), position: Point::new(20, 36) }).await.unwrap();
-    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18) }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()).to_str().unwrap().to_owned(), position: Point::new(20, 36), undraw: false }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18), undraw: false }).await.unwrap();
     // if index = 0, set top to nothing, set middle to 0, and bottom to 1
     // if index = 1, set top to 0, middle to 1, bottom to 2
     // if index = 2, set top to 1, middle to 2, bottom to 3
@@ -260,13 +260,13 @@ async fn main() -> ! {
         let dir = entry.unwrap();
         if index == 0 {
             draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 156) 
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 156), undraw: false
             }).await.unwrap();
 
         }
         else if index == 1 {
             draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206) 
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206), undraw: false 
             }).await.unwrap();
         }
     }
@@ -479,12 +479,13 @@ enum DrawCommand {
     // navigating
     Text {
         content: String,
-        position: Point
+        position: Point,
+        undraw: bool,
     },
     RawFrame {
         data: Vec<u8>,
     },
-    ClearScreen
+    ClearScreen,
 }
 enum ControlCommand {
     Stop,
@@ -622,8 +623,13 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
 
         while let Some(cmd) = draw_rx.blocking_recv() {
             match cmd {
-                DrawCommand::Text { content, position } => {
-                    draw_text(&mut mapped, width, height, content.as_str(), position);
+                DrawCommand::Text { content, position, undraw } => {
+                    if undraw {
+                        undraw_text(&mut mapped, width, height, content.as_str(), position);
+                    }
+                    else {
+                        draw_text(&mut mapped, width, height, content.as_str(), position);
+                    }
                 },
                 DrawCommand::ConfirmingBackground { message, options } => {
                     draw_modal(&mut mapped, width, height, &message, options);
@@ -643,55 +649,66 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     });
 }
 
-fn scroll_up(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
+// hard code lengths 2 and 3, do nothing for len of 1, or at index 0
+// determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2
+async fn scroll_up(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
     // can animate this in future
-    // lengths 2 and 3 need to be handled a bit differently compared to 4+
 
-    // if current index is 0 = do nothing
     if state.nav_state.current_index > 0 {
-        let mut readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-        readdir.reverse();
+        let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+        let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
         if readdir.len() == 2 {
             // index can only be 1 at this point, draw 0 at middle and 1 on bottom
+            draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+            draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
         }
         else if readdir.len() == 3 {
             // index could be 1 or 2 at this point
-            // if index == 1, undraw 0/1/2, draw 0 middle, 1 on bottom
-            // if index == 2, undraw 1/2, draw 0 top, 1 middle, 2 bottom
+            if state.nav_state.current_index == 1 {
+                draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+                draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+                draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+            }
+            else {
+                draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+                draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+            }
         }
         else {
-            // len could be any between 4-69420
+            let next_idx = readdir.get(state.nav_state.current_index + 1);
+            let current_idx = readdir.get(state.nav_state.current_index);
+            let idx_minus_one = readdir.get(state.nav_state.current_index - 1);
+            let idx_minus_two = readdir.get(state.nav_state.current_index - 2);
 
-            // i need index, index+1, and index+2
-            // undraw top and middle,
-            if state.nav_state.current_index == (state.nav_state.file_count - 1) && readdir.len() > 2 {
-                for (index, dir) in readdir.iter().enumerate().skip((readdir.len() - 1) - state.nav_state.current_index) {
-                }
+            // undraw based on indexes available
+            if let Some(next_idx) = next_idx {
+                draw_tx.send(DrawCommand::Text { content: next_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
             }
-            // undraw all
-            // index-1 always exists because not the end,
-            else {
-                // if 2 or more indexes in front of me, get index-1, index, index+1, index+2
-                // else, get index-1, index, index+1
-                for (index, dir) in readdir.iter().enumerate().skip((readdir.len() - 1) - state.nav_state.current_index) {
-                    if (readdir.len() - 1) - index > 1 {
-
-                    }
-                    else {
-
-                    }
-                }
+            if let Some(current_idx) = current_idx {
+                draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
             }
+            if let Some(idx_minus_one) = idx_minus_one {
+                draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+            }
+
+            // draw indexse based on new upcoming states
+            if let Some(current_idx) = current_idx {
+                draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+            }
+            if let Some(idx_minus_one) = idx_minus_one {
+                draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+            }
+            if let Some(idx_minus_two) = idx_minus_two {
+                draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+            }
+
+            // set new states
+            state.nav_state.current_index -= 1;
+            state.nav_state.current_dir = new_current_dir;
         }
-
-
-
-        // set new states
-
-        // draw what is next based on states
     }
     else {
-        // do nothing?
+        // do nothing or play an error buzz? idk
     }
 }
 fn scroll_down(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
