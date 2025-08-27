@@ -1,6 +1,15 @@
 use embedded_graphics::{
   pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{Circle, CornerRadii, Line, Polyline, PrimitiveStyle, Rectangle, RoundedRectangle, Triangle}
 };
+// constants
+pub const TOP_NAV_BG_COORDS: Point = Point::new(10, 10);
+pub const TOP_CAROUSEL_BG_COORDS: Point = Point::new(40, 90);
+pub const MIDDLE_CAROUSEL_BG_COORDS: Point = Point::new(40, 140);
+pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(40, 190);
+
+pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(50, 106);
+pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(50, 156);
+pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(50, 206);
 
 use crate::FramebufferDisplay;
 pub fn draw_clock(fb: &mut [u8], width: usize, height: usize, top_left: Point) {

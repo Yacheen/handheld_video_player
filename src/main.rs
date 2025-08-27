@@ -212,7 +212,7 @@ async fn main() -> ! {
     // top meta
     drawings.push(
         RoundedRectangle::with_equal_corners(
-            Rectangle::new(Point::new(10, 10), Size::new(300, 40)),
+            Rectangle::new(draw::TOP_NAV_BG_COORDS, Size::new(300, 40)),
             Size::new(10, 10),
         )
     );
@@ -221,15 +221,15 @@ async fn main() -> ! {
         drawings.append(
             &mut vec![
                 RoundedRectangle::with_equal_corners(
-                    Rectangle::new(Point::new(40, 90), Size::new(270, 40)),
+                    Rectangle::new(draw::TOP_CAROUSEL_BG_COORDS, Size::new(270, 40)),
                     Size::new(10, 10),
                 ),
                 RoundedRectangle::with_equal_corners(
-                    Rectangle::new(Point::new(40, 140), Size::new(270, 40)),
+                    Rectangle::new(draw::MIDDLE_CAROUSEL_BG_COORDS, Size::new(270, 40)),
                     Size::new(10, 10),
                 ),
                 RoundedRectangle::with_equal_corners(
-                    Rectangle::new(Point::new(40, 190), Size::new(270, 40)),
+                    Rectangle::new(draw::BOTTOM_CAROUSEL_BG_COORDS, Size::new(270, 40)),
                     Size::new(10, 10),
                 ),
             ]
@@ -645,27 +645,54 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
 
 fn scroll_up(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
     // can animate this in future
+    // lengths 2 and 3 need to be handled a bit differently compared to 4+
 
-    // undraw what is currently there
-    // read the current dir and skip to current index UNLESS if its 0 or at end of files
-    for (index, entry) in std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().enumerate() {
-        let dir = entry.unwrap();
-        if state.nav_state.current_index == 0 {
-
+    // if current index is 0 = do nothing
+    if state.nav_state.current_index > 0 {
+        let mut readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+        readdir.reverse();
+        if readdir.len() == 2 {
+            // index can only be 1 at this point, draw 0 at middle and 1 on bottom
         }
-        else if state.nav_state.current_index == (state.nav_state.file_count - 1) {
-
+        else if readdir.len() == 3 {
+            // index could be 1 or 2 at this point
+            // if index == 1, undraw 0/1/2, draw 0 middle, 1 on bottom
+            // if index == 2, undraw 1/2, draw 0 top, 1 middle, 2 bottom
         }
         else {
+            // len could be any between 4-69420
 
+            // i need index, index+1, and index+2
+            // undraw top and middle,
+            if state.nav_state.current_index == (state.nav_state.file_count - 1) && readdir.len() > 2 {
+                for (index, dir) in readdir.iter().enumerate().skip((readdir.len() - 1) - state.nav_state.current_index) {
+                }
+            }
+            // undraw all
+            // index-1 always exists because not the end,
+            else {
+                // if 2 or more indexes in front of me, get index-1, index, index+1, index+2
+                // else, get index-1, index, index+1
+                for (index, dir) in readdir.iter().enumerate().skip((readdir.len() - 1) - state.nav_state.current_index) {
+                    if (readdir.len() - 1) - index > 1 {
+
+                    }
+                    else {
+
+                    }
+                }
+            }
         }
+
+
+
+        // set new states
+
+        // draw what is next based on states
     }
-
-
-    // set new states
-
-    // draw what is next based on states
-
+    else {
+        // do nothing?
+    }
 }
 fn scroll_down(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
 
