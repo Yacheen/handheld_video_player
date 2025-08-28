@@ -290,17 +290,27 @@ async fn main() -> ! {
                     ButtonEvent::Up => {
                         // goto prev file
                         println!("Clicked Up!");
-                        if state.nav_state.current_index != 0 {
+                        if state.nav_state.current_index != 0 && state.nav_state.file_count != 0 {
+                            let draw_tx = draw_tx.clone();
+                            // let nav_state2 = state.nav_state.clone();
+                            scroll_up(&state.nav_state, draw_tx).await;
+                            let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+                            let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
                             state.nav_state.current_index -= 1;
+                            state.nav_state.current_dir = new_current_dir;
                         }
                     }
                     ButtonEvent::Down => {
                         // goto next file
                         println!("Clicked Down!");
                         // handle undraws, then draws based on new state
-
-                        if state.nav_state.current_index != (state.nav_state.file_count - 1) {
+                        if state.nav_state.current_index != (state.nav_state.file_count - 1) && state.nav_state.file_count != 0 {
+                            let draw_tx = draw_tx.clone();
+                            scroll_down(&state.nav_state, draw_tx).await;
+                            let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+                            let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
                             state.nav_state.current_index += 1;
+                            state.nav_state.current_dir = new_current_dir;
                         }
                     }
                 }
@@ -649,70 +659,105 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     });
 }
 
-// hard code lengths 2 and 3, do nothing for len of 1, or at index 0
-// determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2
-async fn scroll_up(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
-    // can animate this in future
+// do nothing len 0/1, hardcode len 2&3, normal for 4+
+// determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2, or vice versa
+// can animate these in future
+async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
 
-    if state.nav_state.current_index > 0 {
-        let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-        let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
-        if readdir.len() == 2 {
-            // index can only be 1 at this point, draw 0 at middle and 1 on bottom
-            draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-        }
-        else if readdir.len() == 3 {
-            // index could be 1 or 2 at this point
-            if state.nav_state.current_index == 1 {
-                draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-                draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-                draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            }
-            else {
-                draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-                draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            }
-        }
-        else {
-            let next_idx = readdir.get(state.nav_state.current_index + 1);
-            let current_idx = readdir.get(state.nav_state.current_index);
-            let idx_minus_one = readdir.get(state.nav_state.current_index - 1);
-            let idx_minus_two = readdir.get(state.nav_state.current_index - 2);
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_minus_one = readdir.get(nav_state.current_index - 1);
+    let idx_minus_two = readdir.get(nav_state.current_index - 2);
+    // if readdir.len() == 2 {
+    //     // index can only be 1 at this point, draw 0 at middle and 1 on bottom
+    //     draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    // }
+    // else if readdir.len() == 3 {
+    //     // index could be 1 or 2 at this point
+    //     if nav_state.current_index == 1 {
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     }
+    //     else {
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     }
+    // }
+    // else {
+    // }
 
-            // undraw based on indexes available
-            if let Some(next_idx) = next_idx {
-                draw_tx.send(DrawCommand::Text { content: next_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            }
-            if let Some(current_idx) = current_idx {
-                draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            }
-            if let Some(idx_minus_one) = idx_minus_one {
-                draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-            }
-
-            // draw indexse based on new upcoming states
-            if let Some(current_idx) = current_idx {
-                draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
-            }
-            if let Some(idx_minus_one) = idx_minus_one {
-                draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
-            }
-            if let Some(idx_minus_two) = idx_minus_two {
-                draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
-            }
-
-            // set new states
-            state.nav_state.current_index -= 1;
-            state.nav_state.current_dir = new_current_dir;
-        }
+    // undraw based on indexes available
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
     }
-    else {
-        // do nothing or play an error buzz? idk
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    }
+
+    // draw indexes based on new upcoming states
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+    }
+    if let Some(idx_minus_two) = idx_minus_two {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
     }
 }
-fn scroll_down(state: &mut State, draw_tx: mpsc::Sender<DrawCommand>) {
+async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_minus_one = readdir.get(nav_state.current_index - 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let idx_plus_two = readdir.get(nav_state.current_index + 2);
 
+    // if readdir.len() == 2 {
+    //     // index can only be 0 at this point, draw 0 at top and 1 on middle
+    //     draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    // }
+    // else if readdir.len() == 3 {
+    //     // index could be 1 or 0 at this point
+    //     if nav_state.current_index == 1 {
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     }
+    //     else {
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    //     }
+    // }
+    // else {
+    // }
+    // undraw based on indexes available
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    }
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+    }
+
+    // draw indexes based on new upcoming states
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+    }
+    if let Some(idx_plus_two) = idx_plus_two {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_two.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+    }
 }
 
 
