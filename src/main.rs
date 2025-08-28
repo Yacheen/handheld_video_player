@@ -294,10 +294,7 @@ async fn main() -> ! {
                             let draw_tx = draw_tx.clone();
                             // let nav_state2 = state.nav_state.clone();
                             scroll_up(&state.nav_state, draw_tx).await;
-                            let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-                            let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
                             state.nav_state.current_index -= 1;
-                            state.nav_state.current_dir = new_current_dir;
                         }
                     }
                     ButtonEvent::Down => {
@@ -307,10 +304,7 @@ async fn main() -> ! {
                         if state.nav_state.current_index != (state.nav_state.file_count - 1) && state.nav_state.file_count != 0 {
                             let draw_tx = draw_tx.clone();
                             scroll_down(&state.nav_state, draw_tx).await;
-                            let readdir: Vec<_> = std::fs::read_dir(state.nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-                            let new_current_dir = readdir.get(state.nav_state.current_index - 1).unwrap().path();
                             state.nav_state.current_index += 1;
-                            state.nav_state.current_dir = new_current_dir;
                         }
                     }
                 }
@@ -667,8 +661,8 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
     let current_idx = readdir.get(nav_state.current_index);
-    let idx_minus_one = readdir.get(nav_state.current_index - 1);
-    let idx_minus_two = readdir.get(nav_state.current_index - 2);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+    let idx_minus_two = { if nav_state.current_index == 0 || nav_state.current_index == 1 { None } else { readdir.get(nav_state.current_index - 2) } };
     // if readdir.len() == 2 {
     //     // index can only be 1 at this point, draw 0 at middle and 1 on bottom
     //     draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
@@ -713,7 +707,7 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
 }
 async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-    let idx_minus_one = readdir.get(nav_state.current_index - 1);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
     let current_idx = readdir.get(nav_state.current_index);
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
     let idx_plus_two = readdir.get(nav_state.current_index + 2);
