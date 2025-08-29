@@ -3,6 +3,9 @@ use embedded_graphics::{
 };
 // constants
 pub const TOP_NAV_BG_COORDS: Point = Point::new(10, 10);
+pub const TOP_NAV_FILE_INDEX_COORDS: Point = Point::new(46, 18);
+pub const TOP_NAV_WEATHER_TEXT_COORDS: Point = Point::new(164, 16);
+pub const TOP_NAV_CLOCK_TEXT_COORDS: Point = Point::new(244, 16);
 pub const TOP_CAROUSEL_BG_COORDS: Point = Point::new(40, 90);
 pub const MIDDLE_CAROUSEL_BG_COORDS: Point = Point::new(40, 140);
 pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(40, 190);

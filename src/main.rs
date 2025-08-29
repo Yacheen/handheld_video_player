@@ -16,6 +16,8 @@ use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
 
+use crate::draw::TOP_NAV_FILE_INDEX_COORDS;
+
 const WIDTH: usize = 320;
 const HEIGHT: usize = 240;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
@@ -30,6 +32,7 @@ enum ButtonEvent {
     Down,
     Select,
     Escape,
+    TimeChanged,
 }
 enum DisplayState {
     Navigating,
@@ -46,6 +49,7 @@ struct State {
     video_state: PlayingSomethingData,
     modal_state: (String, bool),
     error_state: String,
+    current_time: Arc<Mutex<DateTime<Local>>>,
 }
 struct NavigatingData {
     current_dir: PathBuf,
@@ -152,12 +156,21 @@ async fn main() -> ! {
         .to_str()
         .unwrap();
 
+    // buttons channels and tasks-------------------------------------------------------------
+    // btn channel
+    let (btn_tx, mut btn_rx) = mpsc::channel(32);
+    // draw channel
+    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
+    // video/music task command channel (pause, resume, stop)
+    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
+
     let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
     // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
     let current_local_time: DateTime<Local> = Local::now();
-    let formatted_local_time = current_local_time.format("%H:%M");
+    let formatted_local_time = current_local_time.format("%H:%M%P").to_string();
     println!("file count!: {}", file_count);
     println!("formatted local time: {:?}", formatted_local_time);
+    draw_tx.send(DrawCommand::Text { content: formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 
 
     let mut state = State {
@@ -175,15 +188,8 @@ async fn main() -> ! {
         },
         modal_state: (String::new(), false),
         error_state: String::new(),
+        current_time: Arc::new(Mutex::new(current_local_time)),
     };
-
-    // buttons channels and tasks-------------------------------------------------------------
-    // btn channel
-    let (btn_tx, mut btn_rx) = mpsc::channel(32);
-    // draw channel
-    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
-    // video/music task command channel (pause, resume, stop)
-    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
 
     // select
     tokio::spawn(button_task(chip_path, 19, btn_tx.clone(), ButtonEvent::Select));
@@ -193,6 +199,8 @@ async fn main() -> ! {
     tokio::spawn(button_task(chip_path, 13, btn_tx.clone(), ButtonEvent::Up));
     // down
     tokio::spawn(button_task(chip_path, 6, btn_tx.clone(), ButtonEvent::Down));
+    // time changer
+    tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone()));
 
     // draw task - will draw whatever until end of program
     tokio::spawn(start_drawing_task(draw_rx));
@@ -247,8 +255,8 @@ async fn main() -> ! {
     // Dynamic drawings (state)
 
     // current path, file_count, and current file navigated on (index of files of dir)
-    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()).to_str().unwrap().to_owned(), position: Point::new(20, 36), undraw: false }).await.unwrap();
-    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18), undraw: false }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()).to_str().unwrap().to_owned(), position: Point::new(20, 36), undraw: false, is_selected: false }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false }).await.unwrap();
     // if index = 0, set top to nothing, set middle to 0, and bottom to 1
     // if index = 1, set top to 0, middle to 1, bottom to 2
     // if index = 2, set top to 1, middle to 2, bottom to 3
@@ -260,20 +268,17 @@ async fn main() -> ! {
         let dir = entry.unwrap();
         if index == 0 {
             draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 156), undraw: false
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 156), undraw: false, is_selected: false
             }).await.unwrap();
 
         }
         else if index == 1 {
             draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206), undraw: false 
+                content: dir.file_name().to_str().unwrap().to_owned(), position: Point::new(50, 206), undraw: false, is_selected: false,
             }).await.unwrap();
         }
     }
 
-    // texts
-    // current, previous, and next indexes's data.
-    // draw icons based on this iteration's filetype
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
         match &mut state.current_state {
@@ -292,7 +297,6 @@ async fn main() -> ! {
                         println!("Clicked Up!");
                         if state.nav_state.current_index != 0 && state.nav_state.file_count != 0 {
                             let draw_tx = draw_tx.clone();
-                            // let nav_state2 = state.nav_state.clone();
                             scroll_up(&state.nav_state, draw_tx).await;
                             state.nav_state.current_index -= 1;
                         }
@@ -300,12 +304,21 @@ async fn main() -> ! {
                     ButtonEvent::Down => {
                         // goto next file
                         println!("Clicked Down!");
-                        // handle undraws, then draws based on new state
                         if state.nav_state.current_index != (state.nav_state.file_count - 1) && state.nav_state.file_count != 0 {
                             let draw_tx = draw_tx.clone();
                             scroll_down(&state.nav_state, draw_tx).await;
                             state.nav_state.current_index += 1;
                         }
+                    }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
                     }
                 }
             }
@@ -345,6 +358,16 @@ async fn main() -> ! {
                     ButtonEvent::Down => {
                         // invert state
                     }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
+                    }
                 }
             }
             DisplayState::PlayingSomething => {
@@ -360,6 +383,16 @@ async fn main() -> ! {
                     }
                     ButtonEvent::Down => {
                         // turn down volume
+                    }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
                     }
                 }
             }
@@ -377,6 +410,16 @@ async fn main() -> ! {
                     ButtonEvent::Down => {
                         // invert state
                     }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
+                    }
                     _ => ()
                 }
             }
@@ -385,6 +428,16 @@ async fn main() -> ! {
                     ButtonEvent::Select => {
                         // back to previous_state
                     }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
+                    }
                     _ => ()
                 }
             }
@@ -392,6 +445,16 @@ async fn main() -> ! {
                 match event {
                     ButtonEvent::Select => {
                         // shut down device
+                    }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%H:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%H:%M%P").to_string();
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+
                     }
                     _ => ()
                 }
@@ -422,6 +485,15 @@ async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<But
             }
         }
         sleep(Duration::from_millis(10)).await;
+    }
+}
+async fn current_time_task<'a>(mut tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateTime<Local>>>) {
+    loop {
+        let new_current_local_time: DateTime<Local> = Local::now();
+        if new_current_local_time != *state.lock().unwrap() {
+            tx.send(ButtonEvent::TimeChanged).await.unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -485,6 +557,7 @@ enum DrawCommand {
         content: String,
         position: Point,
         undraw: bool,
+        is_selected: bool,
     },
     RawFrame {
         data: Vec<u8>,
@@ -539,11 +612,25 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec
         .fill_color(Rgb565::CSS_NAVAJO_WHITE)
         .build();
 
-    for drawing in drawings {
-        drawing
-            .into_styled(style)
-            .draw(&mut display)
-            .unwrap();
+    let selected_style = PrimitiveStyleBuilder::new()
+        .stroke_width(4)
+        .stroke_color(Rgb565::CSS_GOLD)
+        .fill_color(Rgb565::new(31, 50, 17))
+        .build();
+    // 3rd draw (middle carousel) needs different style
+    for (index, drawing) in drawings.iter().enumerate() {
+        if index == 2 {
+            drawing
+                .into_styled(selected_style)
+                .draw(&mut display)
+                .unwrap();
+        }
+        else {
+            drawing
+                .into_styled(style)
+                .draw(&mut display)
+                .unwrap();
+        }
     }
     // add nav images on top. (folder, temperature, time icons)
     draw::draw_folder(fb, width, height, Point::new(14, 10));
@@ -582,13 +669,22 @@ fn draw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point
         .draw(&mut display)
         .unwrap();
 }
-fn undraw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+fn undraw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point, is_selected: bool) {
     let mut display = FramebufferDisplay { buf: fb, width, height };
-    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_NAVAJO_WHITE);
+    if is_selected {
+        let style = MonoTextStyle::new(&FONT_6X10, Rgb565::new(31, 50, 17));
 
-    Text::with_baseline(msg, point, style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
+        Text::with_baseline(msg, point, style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    else {
+        let style = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_NAVAJO_WHITE);
+
+        Text::with_baseline(msg, point, style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
 }
 fn clear_screen(fb: &mut [u8]) {
     let mut display = FramebufferDisplay { buf: fb, width: 320, height: 240 };
@@ -627,9 +723,9 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
 
         while let Some(cmd) = draw_rx.blocking_recv() {
             match cmd {
-                DrawCommand::Text { content, position, undraw } => {
+                DrawCommand::Text { content, position, undraw, is_selected } => {
                     if undraw {
-                        undraw_text(&mut mapped, width, height, content.as_str(), position);
+                        undraw_text(&mut mapped, width, height, content.as_str(), position, is_selected);
                     }
                     else {
                         draw_text(&mut mapped, width, height, content.as_str(), position);
@@ -653,7 +749,7 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     });
 }
 
-// do nothing len 0/1, hardcode len 2&3, normal for 4+
+// do nothing len 0/1
 // determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2, or vice versa
 // can animate these in future
 async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
@@ -663,47 +759,33 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
     let current_idx = readdir.get(nav_state.current_index);
     let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
     let idx_minus_two = { if nav_state.current_index == 0 || nav_state.current_index == 1 { None } else { readdir.get(nav_state.current_index - 2) } };
-    // if readdir.len() == 2 {
-    //     // index can only be 1 at this point, draw 0 at middle and 1 on bottom
-    //     draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    // }
-    // else if readdir.len() == 3 {
-    //     // index could be 1 or 2 at this point
-    //     if nav_state.current_index == 1 {
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     }
-    //     else {
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     }
-    // }
-    // else {
-    // }
 
     // undraw based on indexes available
     if let Some(idx_minus_one) = idx_minus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
     if let Some(current_idx) = current_idx {
-        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
 
     // draw indexes based on new upcoming states
     if let Some(current_idx) = current_idx {
-        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_minus_one) = idx_minus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(idx_minus_two) = idx_minus_two {
-        draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
+
+    // undraw and draw the new current index
+    // draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18), undraw: false, is_selected: false }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 }
 async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
@@ -712,46 +794,29 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
     let idx_plus_two = readdir.get(nav_state.current_index + 2);
 
-    // if readdir.len() == 2 {
-    //     // index can only be 0 at this point, draw 0 at top and 1 on middle
-    //     draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    // }
-    // else if readdir.len() == 3 {
-    //     // index could be 1 or 0 at this point
-    //     if nav_state.current_index == 1 {
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(0).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     }
-    //     else {
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(1).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //         draw_tx.send(DrawCommand::Text { content: readdir.get(2).unwrap().file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
-    //     }
-    // }
-    // else {
-    // }
     // undraw based on indexes available
     if let Some(idx_plus_one) = idx_plus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
     if let Some(current_idx) = current_idx {
-        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_minus_one) = idx_minus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
 
     // draw indexes based on new upcoming states
     if let Some(current_idx) = current_idx {
-        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
-        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(idx_plus_two) = idx_plus_two {
-        draw_tx.send(DrawCommand::Text { content: idx_plus_two.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false}).await.unwrap();
+        draw_tx.send(DrawCommand::Text { content: idx_plus_two.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 2, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 }
 
 
