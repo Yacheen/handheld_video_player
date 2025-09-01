@@ -4,15 +4,17 @@ use embedded_graphics::{
 // constants
 pub const TOP_NAV_BG_COORDS: Point = Point::new(10, 10);
 pub const TOP_NAV_FILE_INDEX_COORDS: Point = Point::new(46, 18);
+pub const TOP_NAV_PATH_COORDS: Point = Point::new(20, 36);
 pub const TOP_NAV_WEATHER_TEXT_COORDS: Point = Point::new(164, 16);
 pub const TOP_NAV_CLOCK_TEXT_COORDS: Point = Point::new(244, 16);
-pub const TOP_CAROUSEL_BG_COORDS: Point = Point::new(40, 90);
-pub const MIDDLE_CAROUSEL_BG_COORDS: Point = Point::new(40, 140);
-pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(40, 190);
+pub const CAROUSEL_CONTAINER_BG_COORDS:Point = Point::new(40, 90);
+pub const TOP_CAROUSEL_BG_COORDS: Point = Point::new(50, 90);
+pub const MIDDLE_CAROUSEL_BG_COORDS: Point = Point::new(50, 140);
+pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(50, 190);
 
-pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(50, 106);
-pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(50, 156);
-pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(50, 206);
+pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(60, 106);
+pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(60, 156);
+pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);
 
 use crate::FramebufferDisplay;
 pub fn draw_clock(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
