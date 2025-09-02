@@ -309,11 +309,22 @@ async fn main() -> ! {
                     ButtonEvent::Escape => {
                         // go up dir or show error msg
                         println!("Clicked escape!");
+                        let res = exit_dir(&state.nav_state, draw_tx.clone()).await;
+                        match res {
+                            Some((path, file_count)) => {
+                                state.nav_state.current_dir = path;
+                                state.nav_state.current_index = 0;
+                                state.nav_state.file_count = file_count;
+                            }
+                            None => {
+                                // show error? idk, maybe use Err(msg) instead
+                            }
+                        }
                     }
                     ButtonEvent::Select => {
                         // go into dir or show confirmmediaselection
                         println!("Clicked Select!");
-                        let res = go_into_dir(&state.nav_state, draw_tx.clone()).await;
+                        let res = enter_dir(&state.nav_state, draw_tx.clone()).await;
                         match res {
                             Some((path, file_count)) => {
                                 state.nav_state.current_dir = path;
@@ -328,19 +339,23 @@ async fn main() -> ! {
                     ButtonEvent::Up => {
                         // goto prev file
                         println!("Clicked Up!");
-                        if state.nav_state.current_index != 0 && state.nav_state.file_count != 0 {
-                            let draw_tx = draw_tx.clone();
-                            scroll_up(&state.nav_state, draw_tx).await;
-                            state.nav_state.current_index -= 1;
+                        if state.nav_state.file_count > 1 {
+                            if state.nav_state.current_index != 0 {
+                                let draw_tx = draw_tx.clone();
+                                scroll_up(&state.nav_state, draw_tx).await;
+                                state.nav_state.current_index -= 1;
+                            }
                         }
                     }
                     ButtonEvent::Down => {
                         // goto next file
                         println!("Clicked Down!");
-                        if state.nav_state.current_index != (state.nav_state.file_count - 1) && state.nav_state.file_count != 0 {
-                            let draw_tx = draw_tx.clone();
-                            scroll_down(&state.nav_state, draw_tx).await;
-                            state.nav_state.current_index += 1;
+                        if state.nav_state.file_count > 1 {
+                            if state.nav_state.current_index != (state.nav_state.file_count - 1) {
+                                let draw_tx = draw_tx.clone();
+                                scroll_down(&state.nav_state, draw_tx).await;
+                                state.nav_state.current_index += 1;
+                            }
                         }
                     }
                     ButtonEvent::TimeChanged => {
@@ -795,8 +810,14 @@ fn draw_raw_frame(fb: &mut [u8], frame_data: &[u8]) {
 }
 fn format_dir(current_dir: PathBuf) -> String {
     let string = current_dir.to_str().unwrap().to_owned();
-    let formatted = string.replace("/yassin", "");
-    formatted
+    let mut formatted = string.replace("/yassin", "");
+    if formatted.len() > 40 {
+        formatted.replace_range(40..=formatted.len() - 1, "...");
+        formatted
+    }
+    else {
+        formatted
+    }
 }
 async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     tokio::task::spawn_blocking(move || {
@@ -907,7 +928,7 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 2, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 }
-async fn go_into_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
+async fn enter_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
     let current_idx = readdir.get(nav_state.current_index);
@@ -953,6 +974,7 @@ async fn go_into_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
                 Some((entry.path(), file_count))
             }
             else if meta.is_file() {
+                println!("This is a file!");
                 None
             }
             else {
@@ -961,24 +983,60 @@ async fn go_into_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
         }
         else {
             None
-
         }
     }
     else {
         None
     }
-    // if let Some(idx_plus_one) = idx_plus_one {
-    //     draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-    // }
-    // if let Some(current_idx) = current_idx {
-    //     draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
-    // }
-    // if let Some(idx_minus_one) = idx_minus_one {
-    //     draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-    // }
-
 }
-async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
+async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+
+    // undraw the current current_index/file_count,
+    if nav_state.file_count == 0 {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 0, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    else {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    draw_tx.send(DrawCommand::Text { content: format_dir(nav_state.current_dir.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    // if there are files or dirs, undraw them
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+
+    // go up one in current directory
+    let mut new_path = nav_state.current_dir.to_owned();
+    new_path.pop();
+    let new_dir: Vec<_> = std::fs::read_dir(new_path.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    println!("new directory: {:#?}", new_dir);
+    let file_count = new_dir.iter().count();
+    let new_current_idx = new_dir.get(0);
+    let new_idx_plus_one = new_dir.get(1);
+
+    if file_count == 0 {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 0, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    else {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 1, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(new_idx_plus_one) = new_idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: new_idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(new_current_idx) = new_current_idx {
+        draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
+    }
+    draw_tx.send(DrawCommand::Text { content: format_dir(new_path.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    Some((new_path, file_count))
 }
 async fn select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
 }
