@@ -6,7 +6,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::{collections::HashMap, io::prelude::*, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{Arc, Mutex}};
 use std::fs::File;
 use std::thread;
 use linuxfb::Framebuffer;
@@ -324,15 +324,45 @@ async fn main() -> ! {
                     ButtonEvent::Select => {
                         // go into dir or show confirmmediaselection
                         println!("Clicked Select!");
-                        let res = enter_dir(&state.nav_state, draw_tx.clone()).await;
+                        let res = enter_dir_or_select_file(&state.nav_state, draw_tx.clone()).await;
                         match res {
-                            Some((path, file_count)) => {
-                                state.nav_state.current_dir = path;
+                            SelectResponse::File { file_name, file_size, file_extension, file_path } => {
+                                println!("this file extension is: {}", file_extension);
+                                println!("file size: {}", file_size);
+                                println!("file name: {}", file_name);
+                                let draw_tx = draw_tx.clone();
+                                match file_extension.as_str() {
+                                    "rgb565" | "raw" => {
+                                        tokio::spawn(async move {
+                                            let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                            // 24 fps
+                                            let frame_delay = Duration::from_millis(42);
+                                            // open bgr565le file
+                                            // change to whatever current file ur on in dir
+                                            let mut dball = File::open(file_path).unwrap();
+                                            let mut frame = vec![0u8; frame_bytes];
+                                            while let Ok(()) = dball.read_exact(&mut frame) {
+                                                // let started = Instant::now();
+                                                draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                                thread::sleep(frame_delay);
+                                                // let elapsed = started.elapsed();
+                                                // if elapsed < frame_delay {
+                                                //     thread::sleep(frame_delay - elapsed);
+                                                // }
+                                            }
+                                        });
+                                    }
+                                    _ => ()
+                                }
+                            }
+                            SelectResponse::Directory { file_path, file_count } => {
+                                state.nav_state.current_dir = file_path;
                                 state.nav_state.current_index = 0;
                                 state.nav_state.file_count = file_count;
                             }
-                            None => {
-                                // show error? idk, maybe use Err(msg) instead
+                            SelectResponse::Error(err_msg) => {
+                            }
+                            SelectResponse::FatalError(err_msg) => {
                             }
                         }
                     }
@@ -928,7 +958,23 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 2, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 }
-async fn enter_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
+enum SelectResponse {
+    // (file type, file size, file name)
+    File {
+        file_name: String,
+        file_size: u64,
+        file_extension: String,
+        file_path: PathBuf,
+    },
+    Directory{
+        file_path: PathBuf,
+        file_count: usize,
+    },
+    Error(String),
+    FatalError(String),
+}
+
+async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> SelectResponse {
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
     let current_idx = readdir.get(nav_state.current_index);
@@ -971,24 +1017,36 @@ async fn enter_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
                     draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
                 }
                 draw_tx.send(DrawCommand::Text { content: format_dir(entry.path().to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-                Some((entry.path(), file_count))
+                SelectResponse::Directory { file_path: entry.path(), file_count: file_count } 
             }
             else if meta.is_file() {
+                // check extension
+                // if .raw or .rgb565, prompt to play
+
+                // for now, just play
                 println!("This is a file!");
-                None
+                let path = entry.path();
+                let file_extension = path.extension();
+                if let Some(file_extension) = file_extension {
+                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len() / 1_000_000, file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path }
+                }
+                else {
+                    SelectResponse::Error(String::from("Filetype error: File can not be opened: must be either a .mp3, rgb565, or .raw file."))
+                }
             }
             else {
-                None
+                SelectResponse::Error(String::from("Filetype error: File can not be opened: must be either a .mp3, rgb565, or .raw file."))
             }
         }
         else {
-            None
+                SelectResponse::Error(String::from("Unknown error: File could not be opened."))
         }
     }
     else {
-        None
+        SelectResponse::Error(String::from("There are no files or directories in this path."))
     }
 }
+
 async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
     let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
     let idx_plus_one = readdir.get(nav_state.current_index + 1);
