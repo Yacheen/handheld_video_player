@@ -446,14 +446,18 @@ async fn main() -> ! {
                         // turn up volume
                         let volume = state.video_state.volume.load(Ordering::Relaxed);
                         if volume != 100 {
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: true, screen: true }).await.unwrap();
                             state.video_state.volume.fetch_add(5, Ordering::Relaxed);
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: false, screen: true }).await.unwrap();
                         }
                     }
                     ButtonEvent::Down => {
                         // turn down volume
                         let volume = state.video_state.volume.load(Ordering::Relaxed);
                         if volume != 0 {
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: true, screen: true }).await.unwrap();
                             state.video_state.volume.fetch_sub(5, Ordering::Relaxed);
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: false, screen: true }).await.unwrap();
                         }
                     }
                     ButtonEvent::TimeChanged => {
