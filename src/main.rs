@@ -6,7 +6,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
 use std::fs::File;
 use std::thread;
 use linuxfb::Framebuffer;
@@ -24,6 +24,7 @@ const SSD1306_SLAVE_ADDR: u16 = 0x3c;
 
 // mods
 mod draw;
+mod utils;
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
 enum ButtonEvent {
@@ -32,7 +33,10 @@ enum ButtonEvent {
     Select,
     Escape,
     TimeChanged,
+    VolumeChanged,
+    CurrentFrameChanged,
 }
+#[derive(Clone, Copy)]
 enum DisplayState {
     Navigating,
     PlayingSomething,
@@ -42,7 +46,7 @@ enum DisplayState {
     ErrorMessage,
 }
 struct State {
-    current_state: DisplayState,
+    current_state: Arc<tokio::sync::Mutex<DisplayState>>,
     previous_state: DisplayState,
     nav_state: NavigatingData,
     video_state: PlayingSomethingData,
@@ -56,9 +60,11 @@ struct NavigatingData {
     file_count: usize,
 }
 struct PlayingSomethingData {
-    paused: bool,
-    timestamp: u64,
-    volume: u8,
+    paused: Arc<AtomicBool>,
+    // framerate is 24fps, so for example, frame 480 would be 20 seconds into the video
+    current_frame: Arc<AtomicU64>,
+    volume: Arc<AtomicU64>,
+    total_frames: Arc<AtomicU64>,
 }
 // when navigating:
 // show directory on top, file on bottom small screens
@@ -163,7 +169,7 @@ async fn main() -> ! {
 
 
     let mut state = State {
-        current_state: DisplayState::Navigating,
+        current_state: Arc::new(tokio::sync::Mutex::new(DisplayState::Navigating)),
         previous_state: DisplayState::Navigating,
         nav_state: NavigatingData {
             current_dir: current_dir.clone(),
@@ -171,9 +177,10 @@ async fn main() -> ! {
             current_index: 0,
         },
         video_state: PlayingSomethingData {
-            paused: true,
-            volume: 0,
-            timestamp: 0,
+            paused: Arc::new(AtomicBool::new(false)),
+            current_frame: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(AtomicU64::new(0)),
         },
         modal_state: (String::new(), false),
         error_state: String::new(),
@@ -190,9 +197,15 @@ async fn main() -> ! {
     tokio::spawn(button_task(chip_path, 6, btn_tx.clone(), ButtonEvent::Down));
     // time changer
     tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone()));
+    // watch frames and change timestamp on 2nd screen when applicable
+    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.total_frames.clone(), state.video_state.paused.clone()));
 
     // draw task - will draw whatever until end of program
     tokio::spawn(start_drawing_task(draw_rx));
+
+    // volume task
+
+    // timestamp task
 
     // wait for start_drawing_task to be ready
     std::thread::sleep(Duration::from_millis(200));
@@ -204,7 +217,7 @@ async fn main() -> ! {
 
     i2c_screen1_display.clear_buffer();
     i2c_screen1_display.flush().unwrap();
-    match state.current_state {
+    match *state.current_state.lock().await {
         DisplayState::Navigating => {
             Text::with_baseline("Navigating", Point::zero(), text_style, Baseline::Top)
                 .draw(&mut i2c_screen1_display)
@@ -231,15 +244,14 @@ async fn main() -> ! {
         // DisplayState::UnrecoverableError => {
         // }
     }
-    
 
-    if state.video_state.timestamp == 0 {
+    if state.video_state.current_frame.load(Ordering::Relaxed) == 0 {
         Text::with_baseline("0:00 / 0:00", Point::zero(), text_style, Baseline::Top)
             .draw(&mut i2c_screen2_display)
             .unwrap();
         i2c_screen2_display.flush().unwrap();
     }
-    Text::with_baseline(format!("Volume: {}%", state.video_state.volume).as_str(), Point::new(0, 20), text_style, Baseline::Top)
+    Text::with_baseline(format!("Volume: 0%").as_str(), Point::new(0, 20), text_style, Baseline::Top)
         .draw(&mut i2c_screen2_display)
         .unwrap();
     i2c_screen2_display.flush().unwrap();
@@ -303,7 +315,8 @@ async fn main() -> ! {
 
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
-        match &mut state.current_state {
+        let mut current_state = *state.current_state.lock().await;
+        match current_state {
             DisplayState::Navigating => {
                 match event {
                     ButtonEvent::Escape => {
@@ -333,22 +346,47 @@ async fn main() -> ! {
                                 let draw_tx = draw_tx.clone();
                                 match file_extension.as_str() {
                                     "rgb565" | "raw" => {
+                                        current_state = DisplayState::PlayingSomething;
+                                        let current_state = state.current_state.clone(); 
+                                        let paused = state.video_state.paused.clone();
+                                        let current_frame = state.video_state.current_frame.clone();
                                         tokio::spawn(async move {
-                                            let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
-                                            // 24 fps
-                                            let frame_delay = Duration::from_millis(42);
-                                            // open bgr565le file
-                                            // change to whatever current file ur on in dir
-                                            let mut dball = File::open(file_path).unwrap();
-                                            let mut frame = vec![0u8; frame_bytes];
-                                            while let Ok(()) = dball.read_exact(&mut frame) {
-                                                // let started = Instant::now();
-                                                draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
-                                                thread::sleep(frame_delay);
-                                                // let elapsed = started.elapsed();
-                                                // if elapsed < frame_delay {
-                                                //     thread::sleep(frame_delay - elapsed);
-                                                // }
+                                            loop {
+                                                match *current_state.lock().await {
+                                                    DisplayState::ErrorMessage 
+                                                    | DisplayState::UnrecoverableError 
+                                                    | DisplayState::ConfirmingMediaExit 
+                                                    | DisplayState::ConfirmingMediaSelection => continue,
+                                                    DisplayState::Navigating => break,
+                                                    DisplayState::PlayingSomething => {
+                                                        let paused = paused.clone();
+                                                        let draw_tx = draw_tx.clone();
+                                                        let file_path = file_path.clone();
+                                                        let current_frame = current_frame.clone();
+                                                        if paused.load(Ordering::Relaxed) == false {
+                                                            tokio::spawn(async move {
+                                                                // 2 bytes per pixel btw
+                                                                let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                                                // 24 fps
+                                                                let frame_delay = Duration::from_millis(42);
+                                                                // open bgr565le file
+                                                                let mut dball = File::open(file_path).unwrap();
+                                                                let mut frame = vec![0u8; frame_bytes];
+
+                                                                // start from current frame
+                                                                while let Ok(()) = dball.read_exact(&mut frame) {
+                                                                    if paused.load(Ordering::Relaxed) == true {
+                                                                        break
+                                                                    }
+                                                                    draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                                                    tokio::time::sleep(frame_delay).await;
+                                                                    // break if paused
+                                                                    current_frame.fetch_add(1, Ordering::Relaxed);
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                }
                                             }
                                         });
                                     }
@@ -400,8 +438,9 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                         draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                 }
             }
             DisplayState::ConfirmingMediaSelection => {
@@ -441,19 +480,14 @@ async fn main() -> ! {
                         // invert state
                     }
                     ButtonEvent::TimeChanged => {
-                        {
-                            let current_time = state.current_time.lock().unwrap();
-                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-                        }
                         let new_current_local_time: DateTime<Local> = Local::now();
-                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
                         {
                             let mut current_time = state.current_time.lock().unwrap();
                             *current_time = new_current_local_time;
                         }
-                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                 }
             }
             DisplayState::PlayingSomething => {
@@ -466,24 +500,27 @@ async fn main() -> ! {
                     }
                     ButtonEvent::Up => {
                         // turn up volume
+                        let volume = state.video_state.volume.load(Ordering::Relaxed);
+                        if volume != 100 {
+                            state.video_state.volume.fetch_add(5, Ordering::Relaxed);
+                        }
                     }
                     ButtonEvent::Down => {
                         // turn down volume
+                        let volume = state.video_state.volume.load(Ordering::Relaxed);
+                        if volume != 0 {
+                            state.video_state.volume.fetch_sub(5, Ordering::Relaxed);
+                        }
                     }
                     ButtonEvent::TimeChanged => {
-                        {
-                            let current_time = state.current_time.lock().unwrap();
-                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-                        }
                         let new_current_local_time: DateTime<Local> = Local::now();
-                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
                         {
                             let mut current_time = state.current_time.lock().unwrap();
                             *current_time = new_current_local_time;
                         }
-                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                 }
             }
             DisplayState::ConfirmingMediaExit => {
@@ -501,19 +538,14 @@ async fn main() -> ! {
                         // invert state
                     }
                     ButtonEvent::TimeChanged => {
-                        {
-                            let current_time = state.current_time.lock().unwrap();
-                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-                        }
                         let new_current_local_time: DateTime<Local> = Local::now();
-                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
                         {
                             let mut current_time = state.current_time.lock().unwrap();
                             *current_time = new_current_local_time;
                         }
-                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
             }
@@ -523,19 +555,14 @@ async fn main() -> ! {
                         // back to previous_state
                     }
                     ButtonEvent::TimeChanged => {
-                        {
-                            let current_time = state.current_time.lock().unwrap();
-                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-                        }
                         let new_current_local_time: DateTime<Local> = Local::now();
-                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
                         {
                             let mut current_time = state.current_time.lock().unwrap();
                             *current_time = new_current_local_time;
                         }
-                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
             }
@@ -545,19 +572,14 @@ async fn main() -> ! {
                         // shut down device
                     }
                     ButtonEvent::TimeChanged => {
-                        {
-                            let current_time = state.current_time.lock().unwrap();
-                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
-                        }
                         let new_current_local_time: DateTime<Local> = Local::now();
-                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
                         {
                             let mut current_time = state.current_time.lock().unwrap();
                             *current_time = new_current_local_time;
                         }
-                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-
                     }
+                    ButtonEvent::VolumeChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
             }
@@ -595,13 +617,26 @@ async fn current_time_task(mut tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<D
         if new_current_local_time != *state.lock().unwrap() {
             tx.send(ButtonEvent::TimeChanged).await.unwrap();
         }
-        std::thread::sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+async fn current_frame_task(mut tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, total_frames: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+    loop {
+        let paused = paused.load(Ordering::Relaxed);
+        if !paused {
+            let current_frame = current_frame.load(Ordering::Relaxed);
+            let total_frames = total_frames.load(Ordering::Relaxed);
+            // send timestamp changed
+            if current_frame > 0 && current_frame % 24 == 0 {
+                utils::format_timecode(current_frame, total_frames, 24);
+                tx.send(ButtonEvent::TimeChanged).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(42)).await;
+        }
     }
 }
 
 
-// EVERYTHING HERE IS RELATED TO DRAWING ONLY, NO LOGIC
-//
 // drawtarget impl for framebufferdisplay
 struct FramebufferDisplay<'a> {
     buf: &'a mut [u8],
@@ -665,6 +700,11 @@ enum DrawCommand {
         data: Vec<u8>,
     },
     ClearScreen,
+    DrawI2CText {
+        content: String,
+        position: Point,
+        undraw: bool,
+    }
 }
 // to be used for video/music playback me thinks
 enum ControlCommand {
@@ -884,10 +924,21 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                 DrawCommand::ClearScreen => {
                     clear_screen(&mut mapped);
                 }
+                _ => ()
+                // DrawCommand::DrawI2CText { content, position, undraw } => {
+                //     if undraw {
+                //         undraw_text(&mut mapped, width, height, content.as_str(), position);
+                //     }
+                //     else {
+                //         draw_text(&mut mapped, width, height, content.as_str(), position);
+                //     }
+                // }
             }
         }
     });
 }
+// async fn start_i2c_drawing_tasks(mut draw_i2c_rx: mpsc::Receiver<>) {
+// }
 
 // do nothing len 0/1
 // determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2, or vice versa
