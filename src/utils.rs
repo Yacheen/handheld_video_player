@@ -14,12 +14,12 @@ pub fn format_timecode(current_frames: u64, total_frames: u64, fps: u64) -> Stri
 
     if tot_h > 0 {
         format!(
-            "{:01}:{:02}:{:02}/{:01}:{:02}:{:02}",
+            "{:01}:{:02}:{:02} / {:01}:{:02}:{:02}",
             cur_h, cur_m, cur_s, tot_h, tot_m, tot_s
         )
     } else {
         format!(
-            "{:01}:{:02}/{:01}:{:02}",
+            "{:01}:{:02} / {:01}:{:02}",
             cur_m, cur_s, tot_m, tot_s
         )
     }

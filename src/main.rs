@@ -3,7 +3,7 @@ use embedded_graphics::{
     mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyle, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle}, text::{Baseline, Text}
 };
 use embedded_hal::digital::{InputPin, OutputPin};
-use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags, AsyncLineEventHandle};
+use linux_embedded_hal::{gpio_cdev::{AsyncLineEventHandle, Chip, EventRequestFlags, EventType, LineRequestFlags}, I2cdev};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
 use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
@@ -35,7 +35,7 @@ enum ButtonEvent {
     TimeChanged,
     CurrentFrameChanged,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DisplayState {
     Navigating,
     PlayingSomething,
@@ -64,6 +64,7 @@ struct PlayingSomethingData {
     current_frame: Arc<AtomicU64>,
     volume: Arc<AtomicU64>,
     total_frames: Arc<AtomicU64>,
+    drawn_timestamp: String,
 }
 // when navigating:
 // show directory on top, file on bottom small screens
@@ -118,25 +119,6 @@ async fn main() -> ! {
     let chip_path = "/dev/gpiochip0";
     let mut chip = Chip::new(chip_path).unwrap();
 
-    // i2c
-    let i2c_screen1_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-1").unwrap();
-    let i2c_screen2_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-2").unwrap();
-
-    // i2c screen1
-    let i2c_screen1_interface = I2CDisplayInterface::new(i2c_screen1_dev);
-    let mut i2c_screen1_display = Ssd1306::new(i2c_screen1_interface, DisplaySize128x32, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    i2c_screen1_display.init().unwrap();
-    i2c_screen1_display.clear_buffer();
-    i2c_screen1_display.flush().unwrap();
-
-    // i2c screen2
-    let i2c_screen2_interface = I2CDisplayInterface::new(i2c_screen2_dev);
-    let mut i2c_screen2_display = Ssd1306::new(i2c_screen2_interface, DisplaySize128x32, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    i2c_screen2_display.init().unwrap();
-    i2c_screen2_display.clear_buffer();
-    i2c_screen2_display.flush().unwrap();
 
     let mut backlight = CdevPin::new(chip.get_line(5).unwrap().request(LineRequestFlags::OUTPUT, 1, "bl").unwrap()).unwrap();
     backlight.set_high().unwrap();
@@ -155,6 +137,7 @@ async fn main() -> ! {
     let (btn_tx, mut btn_rx) = mpsc::channel(32);
     // draw channel
     let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
+    let (i2c_draw_tx, mut i2c_draw_rx) = mpsc::channel::<DrawCommand>(32);
     // video/music task command channel (pause, resume, stop)
     let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
 
@@ -180,6 +163,7 @@ async fn main() -> ! {
             current_frame: Arc::new(AtomicU64::new(0)),
             total_frames: Arc::new(AtomicU64::new(0)),
             volume: Arc::new(AtomicU64::new(0)),
+            drawn_timestamp: String::from("0:00 / 0:00"),
         },
         modal_state: (String::new(), false),
         error_state: String::new(),
@@ -197,63 +181,13 @@ async fn main() -> ! {
     // time changer
     tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone(), state.current_state.clone()));
     // watch frames and change timestamp on 2nd screen when applicable
-    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.total_frames.clone(), state.video_state.paused.clone()));
+    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.paused.clone()));
 
     // draw task - will draw whatever until end of program
     tokio::spawn(start_drawing_task(draw_rx));
 
-    // volume task
-
-    // timestamp task
-
-    // wait for start_drawing_task to be ready
+    // wait for tasks to be ready or something idk, maybe mostly drawing task to init i2c and spi
     std::thread::sleep(Duration::from_millis(200));
-
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_8X13)
-        .text_color(BinaryColor::On)
-        .build();
-
-    i2c_screen1_display.clear_buffer();
-    i2c_screen1_display.flush().unwrap();
-    match *state.current_state.lock().await {
-        DisplayState::Navigating => {
-            Text::with_baseline("Navigating", Point::zero(), text_style, Baseline::Top)
-                .draw(&mut i2c_screen1_display)
-                .unwrap();
-            i2c_screen1_display.flush().unwrap();
-        }
-        DisplayState::PlayingSomething => {
-            Text::with_baseline("Playing media", Point::zero(), text_style, Baseline::Top)
-                .draw(&mut i2c_screen1_display)
-                .unwrap();
-            i2c_screen1_display.flush().unwrap();
-            // Text::with_baseline(format!("{}"videoname).as_str(), Point::zero(0, 10), text_style, Baseline::Top)
-            //     .draw(&mut i2c_screen1_display)
-            //     .unwrap();
-            // i2c_screen1_display.flush().unwrap();
-        }
-        _ => ()
-        // DisplayState::ConfirmingMediaExit => {
-        // }
-        // DisplayState::ConfirmingMediaSelection => {
-        // }
-        // DisplayState::ErrorMessage => {
-        // }
-        // DisplayState::UnrecoverableError => {
-        // }
-    }
-
-    if state.video_state.current_frame.load(Ordering::Relaxed) == 0 {
-        Text::with_baseline("0:00 / 0:00", Point::zero(), text_style, Baseline::Top)
-            .draw(&mut i2c_screen2_display)
-            .unwrap();
-        i2c_screen2_display.flush().unwrap();
-    }
-    Text::with_baseline(format!("Volume: 0%").as_str(), Point::new(0, 20), text_style, Baseline::Top)
-        .draw(&mut i2c_screen2_display)
-        .unwrap();
-    i2c_screen2_display.flush().unwrap();
 
     // initialize nav ui. the rest will be handled below on button presses based on states
     let mut drawings = Vec::new();
@@ -345,11 +279,18 @@ async fn main() -> ! {
                                 let draw_tx = draw_tx.clone();
                                 match file_extension.as_str() {
                                     "rgb565" | "raw" => {
-                                        current_state = DisplayState::PlayingSomething;
                                         let current_state = state.current_state.clone(); 
                                         let paused = state.video_state.paused.clone();
                                         let current_frame = state.video_state.current_frame.clone();
+                                        state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
                                         tokio::spawn(async move {
+                                            {
+                                                let mut current_state = current_state.lock().await;
+                                                *current_state = DisplayState::PlayingSomething;
+                                                draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                                draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+                                            }
+                                            let mut video_spawned = false;
                                             loop {
                                                 match *current_state.lock().await {
                                                     DisplayState::ErrorMessage 
@@ -358,31 +299,37 @@ async fn main() -> ! {
                                                     | DisplayState::ConfirmingMediaSelection => continue,
                                                     DisplayState::Navigating => break,
                                                     DisplayState::PlayingSomething => {
-                                                        let paused = paused.clone();
-                                                        let draw_tx = draw_tx.clone();
-                                                        let file_path = file_path.clone();
-                                                        let current_frame = current_frame.clone();
-                                                        if paused.load(Ordering::Relaxed) == false {
-                                                            tokio::spawn(async move {
-                                                                // 2 bytes per pixel btw
-                                                                let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
-                                                                // 24 fps
-                                                                let frame_delay = Duration::from_millis(42);
-                                                                // open bgr565le file
-                                                                let mut dball = File::open(file_path).unwrap();
-                                                                let mut frame = vec![0u8; frame_bytes];
+                                                        if video_spawned {
+                                                            continue
+                                                        }
+                                                        else {
+                                                            let paused = paused.clone();
+                                                            let draw_tx = draw_tx.clone();
+                                                            let file_path = file_path.clone();
+                                                            let current_frame = current_frame.clone();
+                                                            if paused.load(Ordering::Relaxed) == false {
+                                                                video_spawned = true;
+                                                                tokio::spawn(async move {
+                                                                    // 2 bytes per pixel btw
+                                                                    let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                                                    // 24 fps
+                                                                    let frame_delay = Duration::from_millis(42);
+                                                                    // open bgr565le file
+                                                                    let mut dball = File::open(file_path).unwrap();
+                                                                    let mut frame = vec![0u8; frame_bytes];
 
-                                                                // start from current frame
-                                                                while let Ok(()) = dball.read_exact(&mut frame) {
-                                                                    if paused.load(Ordering::Relaxed) == true {
-                                                                        break
+                                                                    // start from current frame
+                                                                    while let Ok(()) = dball.read_exact(&mut frame) {
+                                                                        // break if paused
+                                                                        if paused.load(Ordering::Relaxed) == true {
+                                                                            break
+                                                                        }
+                                                                        draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                                                        tokio::time::sleep(frame_delay).await;
+                                                                        current_frame.fetch_add(1, Ordering::Relaxed);
                                                                     }
-                                                                    draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
-                                                                    tokio::time::sleep(frame_delay).await;
-                                                                    // break if paused
-                                                                    current_frame.fetch_add(1, Ordering::Relaxed);
-                                                                }
-                                                            });
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -517,7 +464,18 @@ async fn main() -> ! {
                         }
                     }
                     ButtonEvent::CurrentFrameChanged => {
+                        // draw timestamp to i2c display 2 at point 
 
+                        println!("THE CURRENT FRAME HAS CHANGED");
+                        // undraw
+                        draw_tx.send(DrawCommand::DrawI2CText { content: state.video_state.drawn_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: true, screen: true }).await.unwrap();
+                        
+                        // change states
+                        let new_timestamp = utils::format_timecode(state.video_state.current_frame.load(Ordering::Relaxed), state.video_state.total_frames.load(Ordering::Relaxed) / 153_600, 24);
+                        state.video_state.drawn_timestamp = new_timestamp.clone();
+
+                        // draw
+                        draw_tx.send(DrawCommand::DrawI2CText { content: new_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: false, screen: true }).await.unwrap();
                     }
                 }
             }
@@ -620,16 +578,15 @@ async fn current_time_task(tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateT
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, total_frames: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
     loop {
         let paused = paused.load(Ordering::Relaxed);
         if !paused {
             let current_frame = current_frame.load(Ordering::Relaxed);
-            let total_frames = total_frames.load(Ordering::Relaxed);
             // send timestamp changed
             if current_frame > 0 && current_frame % 24 == 0 {
-                utils::format_timecode(current_frame, total_frames, 24);
-                tx.send(ButtonEvent::TimeChanged).await.unwrap();
+                tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
+                println!("CURRENT FRAME HAS CHANGED, SENDING FROM THE TASk");
             }
             tokio::time::sleep(Duration::from_millis(42)).await;
         }
@@ -704,7 +661,9 @@ enum DrawCommand {
         content: String,
         position: Point,
         undraw: bool,
-    }
+        screen: bool,
+    },
+    ClearI2CScreen(bool),
 }
 // to be used for video/music playback me thinks
 enum ControlCommand {
@@ -891,15 +850,55 @@ fn format_dir(current_dir: PathBuf) -> String {
 }
 async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
     tokio::task::spawn_blocking(move || {
+        // spi
         let fb = Framebuffer::new("/dev/fb1").expect("Failed to open framebuffer");
         let width = fb.get_size().0 as usize;
         let height = fb.get_size().1 as usize;
         let bpp = fb.get_bytes_per_pixel() as usize;
-        let frame_size = width * height * bpp;
 
         let mut mapped = fb.map().expect("Failed to map framebuffer memory");
-        let mut playing_video = false;
-        let mut timestamp = 0;
+
+
+
+        // two i2c screens, initialize and default draws - not storing values after shutdown atm
+        let i2c_screen1_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-1").unwrap();
+        let i2c_screen2_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-2").unwrap();
+
+        let i2c_screen1_interface = I2CDisplayInterface::new(i2c_screen1_dev);
+        let mut i2c_screen1_display = Ssd1306::new(i2c_screen1_interface, DisplaySize128x32, DisplayRotation::Rotate0)
+            .into_buffered_graphics_mode();
+
+        i2c_screen1_display.init().unwrap();
+        i2c_screen1_display.clear_buffer();
+        i2c_screen1_display.flush().unwrap();
+
+        let i2c_screen2_interface = I2CDisplayInterface::new(i2c_screen2_dev);
+        let mut i2c_screen2_display = Ssd1306::new(i2c_screen2_interface, DisplaySize128x32, DisplayRotation::Rotate0)
+            .into_buffered_graphics_mode();
+
+        i2c_screen2_display.init().unwrap();
+        i2c_screen2_display.clear_buffer();
+        i2c_screen2_display.flush().unwrap();
+
+        let text_style = MonoTextStyleBuilder::new()
+            .font(&FONT_8X13)
+            .text_color(BinaryColor::On)
+            .build();
+
+        Text::with_baseline("Navigating", draw::DISPLAYSTATE_COORDS, text_style, Baseline::Top)
+            .draw(&mut i2c_screen1_display)
+            .unwrap();
+        i2c_screen1_display.flush().unwrap();
+
+        Text::with_baseline("0:00 / 0:00", draw::TOP_MEDIA_TIMESTAMP_COORDS, text_style, Baseline::Top)
+            .draw(&mut i2c_screen2_display)
+            .unwrap();
+        i2c_screen2_display.flush().unwrap();
+
+        Text::with_baseline(format!("Volume: 0%").as_str(), Point::new(0, 20), text_style, Baseline::Top)
+            .draw(&mut i2c_screen2_display)
+            .unwrap();
+        i2c_screen2_display.flush().unwrap();
 
         while let Some(cmd) = draw_rx.blocking_recv() {
             match cmd {
@@ -924,6 +923,34 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                 DrawCommand::ClearScreen => {
                     clear_screen(&mut mapped);
                 }
+                DrawCommand::DrawI2CText { content, position, undraw, screen } => {
+                    if screen == false {
+                        if undraw {
+                            undraw_i2c_text(&mut i2c_screen1_display, content.as_str(), position);
+                        }
+                        else {
+                            draw_i2c_text(&mut i2c_screen1_display, content.as_str(), position);
+                        }
+                    }
+                    else {
+                        if undraw {
+                            undraw_i2c_text(&mut i2c_screen2_display, content.as_str(), position);
+                        }
+                        else {
+                            draw_i2c_text(&mut i2c_screen2_display, content.as_str(), position);
+                        }
+                    }
+                }
+                DrawCommand::ClearI2CScreen (screen) => {
+                    // screen 1
+                    if screen == false {
+                        clear_i2c_screen(&mut i2c_screen1_display);
+                    }
+                    // screen 2
+                    else {
+                        clear_i2c_screen(&mut i2c_screen2_display);
+                    }
+                }
                 _ => ()
                 // DrawCommand::DrawI2CText { content, position, undraw } => {
                 //     if undraw {
@@ -937,8 +964,42 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
         }
     });
 }
-// async fn start_i2c_drawing_tasks(mut draw_i2c_rx: mpsc::Receiver<>) {
-// }
+
+fn draw_i2c_text(
+    display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>,
+    content: &str,
+    point: Point
+) {
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::with_baseline(content, point, style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+    display.flush().unwrap();
+}
+fn undraw_i2c_text(
+    display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>,
+    content: &str,
+    point: Point,
+) {
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13)
+        .text_color(BinaryColor::Off)
+        .build();
+
+    Text::with_baseline(content, point, style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+    display.flush().unwrap();
+}
+fn clear_i2c_screen(display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>) {
+    display.clear_buffer();
+    display.flush().unwrap();
+}
+
 
 // do nothing len 0/1
 // determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2, or vice versa
@@ -1079,7 +1140,7 @@ async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sen
                 let path = entry.path();
                 let file_extension = path.extension();
                 if let Some(file_extension) = file_extension {
-                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len() / 1_000_000, file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path }
+                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len(), file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path }
                 }
                 else {
                     SelectResponse::Error(String::from("Filetype error: File can not be opened: must be either a .mp3, rgb565, or .raw file."))
@@ -1146,8 +1207,6 @@ async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>
     }
     draw_tx.send(DrawCommand::Text { content: format_dir(new_path.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     Some((new_path, file_count))
-}
-async fn select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
 }
 
 

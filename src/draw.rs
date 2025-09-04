@@ -2,6 +2,7 @@ use embedded_graphics::{
   pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{Circle, CornerRadii, Line, Polyline, PrimitiveStyle, Rectangle, RoundedRectangle, Triangle}
 };
 // constants
+// spi tft ili 9341 lcd screen 320widthx240height
 pub const TOP_NAV_BG_COORDS: Point = Point::new(10, 10);
 pub const TOP_NAV_FILE_INDEX_COORDS: Point = Point::new(46, 18);
 pub const TOP_NAV_PATH_COORDS: Point = Point::new(20, 36);
@@ -15,6 +16,11 @@ pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(50, 190);
 pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(60, 106);
 pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(60, 156);
 pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);
+
+// i2c screen 128x32 ssd1306 I think
+pub const DISPLAYSTATE_COORDS: Point = Point::new(0, 0);
+pub const TOP_MEDIA_TIMESTAMP_COORDS: Point = Point::new(0, 0);
+pub const TOP_VOLUME_VALUE_COORDS: Point = Point::new(64, 20);
 
 use crate::FramebufferDisplay;
 pub fn draw_clock(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
