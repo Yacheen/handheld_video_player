@@ -33,7 +33,6 @@ enum ButtonEvent {
     Select,
     Escape,
     TimeChanged,
-    VolumeChanged,
     CurrentFrameChanged,
 }
 #[derive(Clone, Copy)]
@@ -196,7 +195,7 @@ async fn main() -> ! {
     // down
     tokio::spawn(button_task(chip_path, 6, btn_tx.clone(), ButtonEvent::Down));
     // time changer
-    tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone()));
+    tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone(), state.current_state.clone()));
     // watch frames and change timestamp on 2nd screen when applicable
     tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.total_frames.clone(), state.video_state.paused.clone()));
 
@@ -439,7 +438,6 @@ async fn main() -> ! {
                         }
                         draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
                     }
-                    ButtonEvent::VolumeChanged => {}
                     ButtonEvent::CurrentFrameChanged => {}
                 }
             }
@@ -486,7 +484,6 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::VolumeChanged => {}
                     ButtonEvent::CurrentFrameChanged => {}
                 }
             }
@@ -519,8 +516,9 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::VolumeChanged => {}
-                    ButtonEvent::CurrentFrameChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {
+
+                    }
                 }
             }
             DisplayState::ConfirmingMediaExit => {
@@ -544,7 +542,6 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::VolumeChanged => {}
                     ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
@@ -561,7 +558,6 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::VolumeChanged => {}
                     ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
@@ -578,7 +574,6 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::VolumeChanged => {}
                     ButtonEvent::CurrentFrameChanged => {}
                     _ => ()
                 }
@@ -611,16 +606,21 @@ async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<But
         sleep(Duration::from_millis(10)).await;
     }
 }
-async fn current_time_task(mut tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateTime<Local>>>) {
+async fn current_time_task(tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateTime<Local>>>, current_state: Arc<tokio::sync::Mutex<DisplayState>>) {
     loop {
-        let new_current_local_time: DateTime<Local> = Local::now();
-        if new_current_local_time != *state.lock().unwrap() {
-            tx.send(ButtonEvent::TimeChanged).await.unwrap();
+        match *current_state.lock().await {
+            DisplayState::Navigating => {
+                let new_current_local_time: DateTime<Local> = Local::now();
+                if new_current_local_time != *state.lock().unwrap() {
+                    tx.send(ButtonEvent::TimeChanged).await.unwrap();
+                }
+            }
+            _ => ()
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-async fn current_frame_task(mut tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, total_frames: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, total_frames: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
     loop {
         let paused = paused.load(Ordering::Relaxed);
         if !paused {
