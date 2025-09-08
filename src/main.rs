@@ -21,6 +21,8 @@ const WIDTH: usize = 320;
 const HEIGHT: usize = 240;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
 const SSD1306_SLAVE_ADDR: u16 = 0x3c;
+const SCREEN_FPS: u8 = 24;
+const PIXELS_PER_FRAME: u32 = 153_600;
 
 // mods
 mod draw;
@@ -181,70 +183,18 @@ async fn main() -> ! {
     // time changer
     tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone(), state.current_state.clone()));
     // watch frames and change timestamp on 2nd screen when applicable
-    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.paused.clone()));
+    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.total_frames.clone(), state.video_state.paused.clone()));
 
     // draw task - will draw whatever until end of program
     tokio::spawn(start_drawing_task(draw_rx));
 
     // wait for tasks to be ready or something idk, maybe mostly drawing task to init i2c and spi
-    std::thread::sleep(Duration::from_millis(200));
-
-    // initialize nav ui. the rest will be handled below on button presses based on states
-    let mut drawings = Vec::new();
-
-    // top meta
-    drawings.push(
-        RoundedRectangle::with_equal_corners(
-            Rectangle::new(draw::TOP_NAV_BG_COORDS, Size::new(300, 40)),
-            Size::new(10, 10),
-        )
-    );
-    // selection carousel
-    {
-        drawings.append(
-            &mut vec![
-                // RoundedRectangle::with_equal_corners(
-                //     Rectangle::new(draw::TOP_CAROUSEL_BG_COORDS, Size::new(270, 40)),
-                //     Size::new(10, 10),
-                // ),
-                RoundedRectangle::with_equal_corners(
-                    Rectangle::new(draw::MIDDLE_CAROUSEL_BG_COORDS, Size::new(250, 40)),
-                    Size::new(12, 12),
-                ),
-                // RoundedRectangle::with_equal_corners(
-                //     Rectangle::new(draw::BOTTOM_CAROUSEL_BG_COORDS, Size::new(270, 40)),
-                //     Size::new(10, 10),
-                // ),
-            ]
-        );
-    }
-
-
+    std::thread::sleep(Duration::from_millis(200)); 
 
     draw_tx.send(DrawCommand::ClearScreen).await.unwrap();
     std::thread::sleep(Duration::from_millis(200));
 
-    draw_tx.send(DrawCommand::NavigatingBackground { drawings }).await.unwrap();
-
-    // current path, file_count, and current file navigated on (index of files of dir)
-    draw_tx.send(DrawCommand::Text { content: format_dir(current_dir.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false }).await.unwrap();
-    draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false }).await.unwrap();
-
-    // draw indexes 0 and 1 to middle and bottom.
-    for (index, entry) in std::fs::read_dir(current_dir.to_owned()).unwrap().enumerate() {
-        let dir = entry.unwrap();
-        if index == 0 {
-            draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false
-            }).await.unwrap();
-
-        }
-        else if index == 1 {
-            draw_tx.send(DrawCommand::Text { 
-                content: dir.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,
-            }).await.unwrap();
-        }
-    }
+    draw_tx.send(DrawCommand::NavigatingBackground { current_dir: current_dir.clone(), file_count: file_count }).await.unwrap();
 
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
@@ -279,64 +229,67 @@ async fn main() -> ! {
                                 let draw_tx = draw_tx.clone();
                                 match file_extension.as_str() {
                                     "rgb565" | "raw" => {
-                                        let current_state = state.current_state.clone(); 
-                                        let paused = state.video_state.paused.clone();
-                                        let current_frame = state.video_state.current_frame.clone();
-                                        state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
-                                        tokio::spawn(async move {
-                                            {
-                                                let mut current_state = current_state.lock().await;
-                                                *current_state = DisplayState::PlayingSomething;
-                                                draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
-                                                draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                                            }
-                                            let mut video_spawned = false;
-                                            loop {
-                                                match *current_state.lock().await {
-                                                    DisplayState::ErrorMessage 
-                                                    | DisplayState::UnrecoverableError 
-                                                    | DisplayState::ConfirmingMediaExit 
-                                                    | DisplayState::ConfirmingMediaSelection => continue,
-                                                    DisplayState::Navigating => break,
-                                                    DisplayState::PlayingSomething => {
-                                                        if video_spawned {
-                                                            continue
-                                                        }
-                                                        else {
-                                                            let paused = paused.clone();
-                                                            let draw_tx = draw_tx.clone();
-                                                            let file_path = file_path.clone();
-                                                            let current_frame = current_frame.clone();
-                                                            if paused.load(Ordering::Relaxed) == false {
-                                                                video_spawned = true;
-                                                                tokio::spawn(async move {
-                                                                    // 2 bytes per pixel btw
-                                                                    let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
-                                                                    // 24 fps
-                                                                    let frame_delay = Duration::from_millis(42);
-                                                                    // open bgr565le file
-                                                                    let mut dball = File::open(file_path).unwrap();
-                                                                    let mut frame = vec![0u8; frame_bytes];
-
-                                                                    // start from current frame
-                                                                    while let Ok(()) = dball.read_exact(&mut frame) {
-                                                                        // break if paused
-                                                                        if paused.load(Ordering::Relaxed) == true {
-                                                                            break
-                                                                        }
-                                                                        draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
-                                                                        tokio::time::sleep(frame_delay).await;
-                                                                        current_frame.fetch_add(1, Ordering::Relaxed);
-                                                                    }
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
+                                        draw_tx.send(DrawCommand::ConfirmingBackground { message: format!("Play video: {}?\n\n File size: {}", file_name, file_size), options: vec!["No!".to_string(), "Yes!".to_string()] }).await.unwrap();
+                                        // let current_state = state.current_state.clone(); 
+                                        // let paused = state.video_state.paused.clone();
+                                        // let current_frame = state.video_state.current_frame.clone();
+                                        // state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
+                                        // tokio::spawn(async move {
+                                        //     {
+                                        //         let mut current_state = current_state.lock().await;
+                                        //         *current_state = DisplayState::PlayingSomething;
+                                        //         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                        //         draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+                                        //     }
+                                        //     let mut video_spawned = false;
+                                        //     loop {
+                                        //         match *current_state.lock().await {
+                                        //             DisplayState::ErrorMessage 
+                                        //             | DisplayState::UnrecoverableError 
+                                        //             | DisplayState::ConfirmingMediaExit 
+                                        //             | DisplayState::ConfirmingMediaSelection => continue,
+                                        //             DisplayState::Navigating => break,
+                                        //             DisplayState::PlayingSomething => {
+                                        //                 if video_spawned {
+                                        //                     continue
+                                        //                 }
+                                        //                 else {
+                                        //                     let paused = paused.clone();
+                                        //                     let draw_tx = draw_tx.clone();
+                                        //                     let file_path = file_path.clone();
+                                        //                     let current_frame = current_frame.clone();
+                                        //                     if paused.load(Ordering::Relaxed) == false {
+                                        //                         video_spawned = true;
+                                        //                         tokio::spawn(async move {
+                                        //                             // 2 bytes per pixel btw
+                                        //                             let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                        //                             // 24 fps
+                                        //                             let frame_delay = Duration::from_millis(42);
+                                        //                             // open bgr565le file
+                                        //                             let mut dball = File::open(file_path).unwrap();
+                                        //                             let mut frame = vec![0u8; frame_bytes];
+                                        //
+                                        //                             // start from current frame
+                                        //                             while let Ok(()) = dball.read_exact(&mut frame) {
+                                        //                                 // break if paused
+                                        //                                 if paused.load(Ordering::Relaxed) == true {
+                                        //                                     break
+                                        //                                 }
+                                        //                                 draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                        //                                 tokio::time::sleep(frame_delay).await;
+                                        //                                 current_frame.fetch_add(1, Ordering::Relaxed);
+                                        //                             }
+                                        //                         });
+                                        //                     }
+                                        //                 }
+                                        //             }
+                                        //         }
+                                        //     }
+                                        // });
                                     }
-                                    _ => ()
+                                    _ =>  {
+                                        draw_tx.send(DrawCommand::ConfirmingBackground { message: "Can not currently play this kind of file - handling of different files (such as txt's, and other basic formats) are in development!".to_string(), options: vec!["Okay".to_string()] }).await.unwrap();
+                                    }
                                 }
                             }
                             SelectResponse::Directory { file_path, file_count } => {
@@ -471,11 +424,12 @@ async fn main() -> ! {
                         // draw timestamp to i2c display 2 at point 
 
                         println!("THE CURRENT FRAME HAS CHANGED");
+                        // let current_frame = state.video_state.current_frame.load(Ordering::Relaxed);
                         // undraw
                         draw_tx.send(DrawCommand::DrawI2CText { content: state.video_state.drawn_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: true, screen: true }).await.unwrap();
                         
                         // change states
-                        let new_timestamp = utils::format_timecode(state.video_state.current_frame.load(Ordering::Relaxed), state.video_state.total_frames.load(Ordering::Relaxed) / 153_600, 24);
+                        let new_timestamp = utils::format_timecode(state.video_state.current_frame.load(Ordering::Relaxed), state.video_state.total_frames.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64, SCREEN_FPS as u64);
                         state.video_state.drawn_timestamp = new_timestamp.clone();
 
                         // draw
@@ -582,13 +536,14 @@ async fn current_time_task(tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateT
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, file_size: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
     loop {
         let paused = paused.load(Ordering::Relaxed);
         if !paused {
             let current_frame = current_frame.load(Ordering::Relaxed);
+            let total_frames = file_size.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64;
             // send timestamp changed
-            if current_frame > 0 && current_frame % 24 == 0 {
+            if current_frame > 0 && current_frame % 24 == 0 && current_frame != total_frames {
                 tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
                 println!("CURRENT FRAME HAS CHANGED, SENDING FROM THE TASk");
             }
@@ -647,7 +602,8 @@ enum DrawCommand {
     // draw rect on top, 3 rects in middle/bottom for file icon, and file name after state change
     // to navigating
     NavigatingBackground {
-        drawings: Vec<RoundedRectangle>,
+        current_dir: PathBuf,
+        file_count: usize,
     },
     // text only happens when navigatingbackground has been sent and state has changed to
     // navigating
@@ -677,19 +633,80 @@ enum ControlCommand {
 }
 // light background, dark text
 fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Vec<String>) {
+    
     clear_screen(fb);
-    // wipe screen first TODO()
+
+    // add error msg, line break every 30 characters, map options on bottom spaced based on len
     let mut display = FramebufferDisplay { buf: fb, width, height };
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_width(3)
-        .stroke_color(Rgb565::CSS_SKY_BLUE)
-        // .fill_color(Rgb565::CSS_NAVAJO_WHITE)
+    let modal_style = PrimitiveStyleBuilder::new()
+        .stroke_width(2)
+        .stroke_color(Rgb565::WHITE)
         .build();
 
-    Rectangle::new(Point::new(10, height as i32 / 2), Size::new(40, 20))
-        .into_styled(style)
+    // border of modal
+    Rectangle::new(Point::new(40, 40), Size::new(240, 160))
+        .into_styled(modal_style)
         .draw(&mut display)
         .unwrap();
+
+    let mut formatted_msg = String::new();
+    for (index, character) in msg.chars().enumerate() {
+        formatted_msg += character.to_string().as_str();
+        if (index + 1) % 25 == 0 && (index + 1) != msg.len() {
+            formatted_msg += "\n";
+        }
+    }
+
+    // parse msg, break it every 25 chars
+    let txt_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    Text::with_baseline(formatted_msg.as_str(), Point::new(60, 60), txt_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+
+    // options
+    let option_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_SKY_BLUE)
+        .build();
+
+    // 6 padding on left, 4 on top
+    let num_of_options = options.iter().count();
+    if num_of_options == 1 {
+        // "okay" option
+        Rectangle::new(Point::new(140, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("Okay!", Point::new(146, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    else if num_of_options == 2 {
+        // no option
+        Rectangle::new(Point::new(110, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("No!", Point::new(116, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        // border of modal
+        // yes option
+        Rectangle::new(Point::new(170, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("Yes!", Point::new(176, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    // else if num_of_options == 3 {
+    //
+    // }
+    // else {
+    //
+    // }
 }
 fn undraw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str) {
     let mut display = FramebufferDisplay { buf: fb, width, height };
@@ -706,7 +723,7 @@ fn undraw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str) {
         .unwrap();
 }
 // top rect, and 3 middle rects spaced out by 10px
-fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec<RoundedRectangle>) {
+fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: PathBuf, file_count: usize) {
     // wipe screen first TODO()
     clear_screen(fb);
 
@@ -717,65 +734,89 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, drawings: Vec
     let nav_style = PrimitiveStyleBuilder::new()
         .stroke_width(1)
         .stroke_color(Rgb565::WHITE)
-        // .fill_color(Rgb565::CSS_NAVAJO_WHITE)
         .build();
 
     let selected_style = PrimitiveStyleBuilder::new()
         .stroke_width(2)
         .stroke_color(Rgb565::CSS_SKY_BLUE)
-        // .fill_color(Rgb565::new(31, 50, 17))
         .build();
 
-    // try these:
-    // rgb(200, 200, 200),
-    // rgb(110, 110, 120)
-    // rgb(90, 90, 90)
-    // rgb(100, 105, 115)
-    // rgb(80, 85, 95)
-    // rgb(75, 85, 105)
     let carousel_style = PrimitiveStyleBuilder::new()
         .stroke_width(2)
         .stroke_color(Rgb565::CSS_LIGHT_BLUE)
-        // .fill_color(Rgb565::CSS_DIM_GRAY)
         .build();
-        RoundedRectangle::with_equal_corners(
-            Rectangle::new(draw::CAROUSEL_CONTAINER_BG_COORDS, Size::new(270, 140)),
-            Size::new(12, 12),
-        )
-        .into_styled(carousel_style)
+
+    // top meta
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::TOP_NAV_BG_COORDS, Size::new(300, 40)),
+        Size::new(10, 10),
+    )
+    .into_styled(nav_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // carousel 
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::CAROUSEL_CONTAINER_BG_COORDS, Size::new(270, 140)),
+        Size::new(12, 12),
+    )
+    .into_styled(carousel_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // selected item in carousel
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::MIDDLE_CAROUSEL_BG_COORDS, Size::new(250, 40)),
+        Size::new(12, 12),
+    )
+    .into_styled(selected_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // add nav images on top. (folder, temperature, time icons)
+    draw::draw_folder(&mut display, width, height, Point::new(14, 10));
+    draw::draw_cloud(&mut display, width, height, Point::new(150, 10));
+    draw::draw_clock(&mut display, width, height, Point::new(220, 10));
+
+    // current path, file_count, and current file navigated on (index of files of dir)
+    let txt_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
+    // current_dir
+    Text::with_baseline(format_dir(current_dir.to_owned()).as_str(), draw::TOP_NAV_PATH_COORDS, txt_style, Baseline::Top)
         .draw(&mut display)
         .unwrap();
-    // 3rd draw (middle carousel) needs different style
-    for (index, drawing) in drawings.iter().enumerate() {
-        if index == 0 {
-            drawing
-                .into_styled(nav_style)
-                .draw(&mut display)
-                .unwrap();
-        }
-        else {
-            drawing
-                .into_styled(selected_style)
-                .draw(&mut display)
-                .unwrap();
-        }
-        // if index == 2 {
-        //     drawing
-        //         .into_styled(selected_style)
-        //         .draw(&mut display)
-        //         .unwrap();
-        // }
-        // else {
-        //     drawing
-        //         .into_styled(style)
-        //         .draw(&mut display)
-        //         .unwrap();
-        // }
+
+    // file_count
+    if file_count == 0 {
+        Text::with_baseline(format!("0/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
     }
-    // add nav images on top. (folder, temperature, time icons)
-    draw::draw_folder(fb, width, height, Point::new(14, 10));
-    draw::draw_cloud(fb, width, height, Point::new(150, 10));
-    draw::draw_clock(fb, width, height, Point::new(220, 10));
+    else {
+        Text::with_baseline(format!("1/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+
+    // middle and bottom carousel (index 0/1 if exists?)
+
+    Text::with_baseline(format!("1/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+    let readdir: Vec<_> = std::fs::read_dir(current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let current_idx = readdir.get(0);
+    let idx_plus_one = readdir.get(1);
+
+    if let Some(current_idx) = current_idx {
+        Text::with_baseline(current_idx.file_name().to_str().unwrap(), draw::MIDDLE_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        Text::with_baseline(idx_plus_one.file_name().to_str().unwrap(), draw::BOTTOM_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
 
     // THESE ALL SHOULD PROBABLY BE HAND DRAWN, GPT5 CANT DRAW ICONS FOR SHIT LOL
     // draw::draw_camera(fb, width, height, Point::new(40, 100));
@@ -918,8 +959,8 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                     draw_modal(&mut mapped, width, height, &message, options);
                 },
         // current dir, 
-                DrawCommand::NavigatingBackground { drawings } => {
-                    draw_nav_background(&mut mapped, width, height, drawings);
+                DrawCommand::NavigatingBackground { current_dir, file_count } => {
+                    draw_nav_background(&mut mapped, width, height, current_dir, file_count);
                 }
                 DrawCommand::RawFrame { data } => {
                     draw_raw_frame(&mut mapped, &data);

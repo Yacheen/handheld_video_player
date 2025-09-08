@@ -23,8 +23,7 @@ pub const TOP_MEDIA_TIMESTAMP_COORDS: Point = Point::new(0, 0);
 pub const TOP_VOLUME_VALUE_COORDS: Point = Point::new(64, 20);
 
 use crate::FramebufferDisplay;
-pub fn draw_clock(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
-    let mut display = FramebufferDisplay { buf: fb, width, height };
+pub fn draw_clock(display: &mut FramebufferDisplay, width: usize, height: usize, top_left: Point) {
     let style = PrimitiveStyle::with_stroke(Rgb565::WHITE, 1);
 
     // Use a radius of 8 to allow 1px stroke padding around the circle
@@ -34,23 +33,23 @@ pub fn draw_clock(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
     // Draw the clock face (circle)
     Circle::new(center - Size::new(radius, radius), radius * 2)
         .into_styled(style)
-        .draw(&mut display)
+        .draw(display)
         .unwrap();
 
     // Hour hand (upward)
     Line::new(center, center + Point::new(0, -4))
         .into_styled(style)
-        .draw(&mut display)
+        .draw(display)
         .unwrap();
 
     // Minute hand (rightward)
     Line::new(center, center + Point::new(5, 0))
         .into_styled(style)
-        .draw(&mut display)
+        .draw(display)
         .unwrap();
 }
-pub fn draw_folder(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
-    let mut display = FramebufferDisplay { buf: fb, width, height };
+pub fn draw_folder(display: &mut FramebufferDisplay, width: usize, height: usize, top_left: Point) {
+    // let mut display = FramebufferDisplay { buf: fb, width, height };
     let style = PrimitiveStyle::with_stroke(Rgb565::WHITE, 1);
 
     // Folder outline (with tab)
@@ -67,11 +66,10 @@ pub fn draw_folder(fb: &mut [u8], width: usize, height: usize, top_left: Point) 
     ];
     Polyline::new(&outline)
         .into_styled(style)
-        .draw(&mut display)
+        .draw(display)
         .unwrap();
 }
-pub fn draw_cloud(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
-    let mut display = FramebufferDisplay { buf: fb, width, height };    
+pub fn draw_cloud(display: &mut FramebufferDisplay, width: usize, height: usize, top_left: Point) {
     let style = PrimitiveStyle::with_stroke(Rgb565::WHITE, 1);
     
     let outline = [
@@ -100,7 +98,7 @@ pub fn draw_cloud(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
 
     Polyline::new(&outline)
         .into_styled(style)
-        .draw(&mut display)
+        .draw(display)
         .unwrap();
 }
 pub fn draw_camera(fb: &mut [u8], width: usize, height: usize, top_left: Point) {
