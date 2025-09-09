@@ -1,233 +1,1258 @@
+use chrono::{DateTime, Local};
 use embedded_graphics::{
-    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyleBuilder},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    text::{Baseline, Text},
+    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyle, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle}, text::{Baseline, Text}
 };
 use embedded_hal::digital::{InputPin, OutputPin};
-use linux_embedded_hal::gpio_cdev::{Chip, EventRequestFlags, EventType, LineRequestFlags};
+use linux_embedded_hal::{gpio_cdev::{AsyncLineEventHandle, Chip, EventRequestFlags, EventType, LineRequestFlags}, I2cdev};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::io::prelude::*;
+use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
 use std::fs::File;
 use std::thread;
-use std::time::{Duration, Instant};
 use linuxfb::Framebuffer;
 use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
-// const WIDTH: usize = 320;
-// const HEIGHT: usize = 240;
+use tokio::{sync::mpsc, time::{sleep, Duration, Instant}};
+use futures::StreamExt;
+use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
+use std::process::Command;
+
+
+const WIDTH: usize = 320;
+const HEIGHT: usize = 240;
 // const FRAME_SIZE: usize = WIDTH * HEIGHT * 2;
 const SSD1306_SLAVE_ADDR: u16 = 0x3c;
+const SCREEN_FPS: u8 = 24;
+const PIXELS_PER_FRAME: u32 = 153_600;
 
-fn main() -> ! {
-    println!("Hello, world!");
+// mods
+mod draw;
+mod utils;
+
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+enum ButtonEvent {
+    Up,
+    Down,
+    Select,
+    Escape,
+    TimeChanged,
+    CurrentFrameChanged,
+}
+#[derive(Clone, Copy, Debug)]
+enum DisplayState {
+    Navigating,
+    PlayingSomething,
+    ConfirmingMediaSelection,
+    ConfirmingMediaExit,
+    UnrecoverableError,
+    ErrorMessage,
+}
+struct State {
+    current_state: Arc<tokio::sync::Mutex<DisplayState>>,
+    previous_state: DisplayState,
+    nav_state: NavigatingData,
+    video_state: PlayingSomethingData,
+    modal_state: (String, bool),
+    error_state: String,
+    current_time: Arc<Mutex<DateTime<Local>>>,
+}
+struct NavigatingData {
+    current_dir: PathBuf,
+    current_index: usize,
+    file_count: usize,
+}
+struct PlayingSomethingData {
+    paused: Arc<AtomicBool>,
+    // framerate is 24fps, so for example, frame 480 would be 20 seconds into the video
+    current_frame: Arc<AtomicU64>,
+    volume: Arc<AtomicU64>,
+    total_frames: Arc<AtomicU64>,
+    drawn_timestamp: String,
+}
+// when navigating:
+// show directory on top, file on bottom small screens
+
+// when pressing esc, show exitconfirmation no on top, yes on bottom
+
+// show ok button on bottom screen to exit error
+
+// show shut down button on bottom screen during unrecoverable error
+
+// show what's currently playing on first samll screen
+// show timestamp & volume on 2nd screen (and what else?)
+
+// what do I need
+// store timestamp of where ur currently at in video in terms of bytes
+// esc - 
+// if Navigating, go outside dir or show error msg when going too high.
+// if PlayingSomething - set state to ConfirmingMediaExit and pause video, and previous_state
+// if ConfirmingMediaSelection, set state to Navigating, and previous_state
+// 
+// either cd out of dir or bringup "are u sure u wanna stop watching" modal
+//
+// select - 
+// if navigating state, go inside dir.
+// else if PlayingSomething, pause or continue video based on current state of PlayingSomething
+// else if ConfirmingSelectingMedia, choose the option the bool is currently set to (0 = no, 1 = yes)
+// else if ConfirmingExitPlaying, choose the option the bool is currently set to (0 = no, 1 = yes)
+//
+// up - 
+// if navigating, goto previous file,
+// if playingSomething, increase volume
+// if ConfirmingSelectingMedia, set bool to no (0)
+// if ConfirmingExitPlaying, set bool to no (0)
+//
+// down - 
+// if Navigating, goto next file
+// if PlayingSomething, turn volume down
+// if ConfirmingSelectingMedia, set bool to yes (1)
+// if ConfirmingMediaExit, set bool to  yes (1)
+
+#[tokio::main]
+async fn main() -> ! {
+    // set current directory to home
+    std::env::set_current_dir("/home/yassin/").unwrap();
+    let output = Command::new("./setup_gpios.sh")
+        .output()
+        .expect("Failed to execute setup gpio pullup inputs")
+    ;
+    thread::sleep(Duration::from_secs(2));
+
     // gpio setup
-    let mut chip = Chip::new("/dev/gpiochip0").unwrap();
-
-    // i2c
-    let i2c_screen1_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-1").unwrap();
-    let i2c_screen2_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-2").unwrap();
-
-    // init sequence -  not needed cause not using i2cdev::I2cDevice or whatev, using just I2cDev::new
-    // i2c_screen1_dev.smbus_write_byte_data(0xF0, 0x55).unwrap();
-    // i2c_screen1_dev.smbus_write_byte_data(0xFB, 0x00).unwrap();
-    // i2c_screen2_dev.smbus_write_byte_data(0xF0, 0x55).unwrap();
-    // i2c_screen2_dev.smbus_write_byte_data(0xFB, 0x00).unwrap();
-    // thread::sleep(Duration::from_millis(100));
+    let chip_path = "/dev/gpiochip0";
+    let mut chip = Chip::new(chip_path).unwrap();
 
 
-
-    // screen1
-    let i2c_screen1_interface = I2CDisplayInterface::new(i2c_screen1_dev);
-    let mut i2c_screen1_display = Ssd1306::new(i2c_screen1_interface, DisplaySize128x32, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    i2c_screen1_display.init().unwrap();
-    i2c_screen1_display.clear_buffer();
-    i2c_screen1_display.flush().unwrap();
-
-    //screen2
-    let i2c_screen2_interface = I2CDisplayInterface::new(i2c_screen2_dev);
-    let mut i2c_screen2_display = Ssd1306::new(i2c_screen2_interface, DisplaySize128x32, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
-    i2c_screen2_display.init().unwrap();
-    i2c_screen2_display.clear_buffer();
-    i2c_screen2_display.flush().unwrap();
-
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_8X13)
-        .text_color(BinaryColor::On)
-        .build();
-
-    Text::with_baseline("Hello,", Point::zero(), text_style, Baseline::Top)
-        .draw(&mut i2c_screen1_display)
-        .unwrap();
-    i2c_screen1_display.flush().unwrap();
-    
-
-    Text::with_baseline("Yassin", Point::zero(), text_style, Baseline::Top)
-        .draw(&mut i2c_screen2_display)
-        .unwrap();
-    i2c_screen2_display.flush().unwrap();
-
-
-    // delay init
-    // let mut delay = Delay {};
-    //
-    // // spi0 tft ili9341 display------------------------------------------------------
-    // // dc and rst
-    // let mut dc = CdevPin::new(chip.get_line(27).unwrap().request(LineRequestFlags::OUTPUT, 0, "dc").unwrap()).unwrap();
-    // let mut rst = CdevPin::new(chip.get_line(22).unwrap().request(LineRequestFlags::OUTPUT, 0, "rst").unwrap()).unwrap();
-
-    //spi pins
-    // let sclk = CdevPin::new(chip.get_line(11).unwrap().request(LineRequestFlags::OUTPUT, 0, "sclk").unwrap()).unwrap();
-    // let mosi = CdevPin::new(chip.get_line(10).unwrap().request(LineRequestFlags::OUTPUT, 0, "mosi").unwrap()).unwrap();
-    // let miso = CdevPin::new(chip.get_line(9).unwrap().request(LineRequestFlags::OUTPUT, 0, "miso").unwrap()).unwrap();
     let mut backlight = CdevPin::new(chip.get_line(5).unwrap().request(LineRequestFlags::OUTPUT, 1, "bl").unwrap()).unwrap();
-    backlight.set_high().unwrap(); // enable display backlight
+    backlight.set_high().unwrap();
 
-    // open framebuffer device, get properties
-    let fb = Framebuffer::new("/dev/fb1").unwrap();
-    let (width, height) = fb.get_size();
-    let bpp = fb.get_bytes_per_pixel() as usize;
-    let (vx, vy) = fb.get_virtual_size();
-    eprintln!("fb: {}×{}, virtual {}×{}", width, height, vx, vy);
+    // STATE INITIALIZATION----------------------------------------------------------------------------------------------------
+    let current_dir = std::env::current_dir().unwrap();
+    let current_dir_as_str= current_dir
+        .iter()
+        .last()
+        .unwrap()
+        .to_str()
+        .unwrap();
 
-    // map framebuffer mem once
-    let mut fb_mem = fb.map().unwrap();
+    // buttons channels and tasks-------------------------------------------------------------
+    // btn channel
+    let (btn_tx, mut btn_rx) = mpsc::channel(32);
+    // draw channel
+    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
+    let (i2c_draw_tx, mut i2c_draw_rx) = mpsc::channel::<DrawCommand>(32);
+    // video/music task command channel (pause, resume, stop)
+    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
 
-    // bytes per file & and fps
-    let frame_bytes = width as usize * height as usize * bpp;
-    // 24 fps
-    let frame_delay = Duration::from_millis(42);
+    let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
+    // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
+    let current_local_time: DateTime<Local> = Local::now();
+    let formatted_local_time = current_local_time.format("%-I:%M%P").to_string();
+    println!("file count!: {}", file_count);
+    println!("formatted local time: {:?}", formatted_local_time);
+    draw_tx.send(DrawCommand::Text { content: formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
 
-    // open rgb565 file
-    let mut dball = File::open("dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
-    let mut frame = vec![0u8; frame_bytes];
 
-    println!("Stream: {} bytes/frame → {}ms/frame at 24fps", frame_bytes, 42);
+    let mut state = State {
+        current_state: Arc::new(tokio::sync::Mutex::new(DisplayState::Navigating)),
+        previous_state: DisplayState::Navigating,
+        nav_state: NavigatingData {
+            current_dir: current_dir.clone(),
+            file_count: file_count,
+            current_index: 0,
+        },
+        video_state: PlayingSomethingData {
+            paused: Arc::new(AtomicBool::new(false)),
+            current_frame: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(AtomicU64::new(0)),
+            drawn_timestamp: String::from("0:00 / 0:00"),
+        },
+        modal_state: (String::new(), false),
+        error_state: String::new(),
+        current_time: Arc::new(Mutex::new(current_local_time)),
+    };
 
-    // stream loop
+    // select
+    tokio::spawn(button_task(chip_path, 19, btn_tx.clone(), ButtonEvent::Select));
+    // escape
+    tokio::spawn(button_task(chip_path, 26, btn_tx.clone(), ButtonEvent::Escape));
+    // up
+    tokio::spawn(button_task(chip_path, 13, btn_tx.clone(), ButtonEvent::Up));
+    // down
+    tokio::spawn(button_task(chip_path, 6, btn_tx.clone(), ButtonEvent::Down));
+    // time changer
+    tokio::spawn(current_time_task(btn_tx.clone(), state.current_time.clone(), state.current_state.clone()));
+    // watch frames and change timestamp on 2nd screen when applicable
+    tokio::spawn(current_frame_task(btn_tx.clone(), state.video_state.current_frame.clone(), state.video_state.total_frames.clone(), state.video_state.paused.clone()));
 
-    // escape - black cable
-    let mut escape_btn = CdevPin::new(chip.get_line(26).unwrap().request(LineRequestFlags::INPUT, 1, "esc").unwrap()).unwrap();
+    // draw task - will draw whatever until end of program
+    tokio::spawn(start_drawing_task(draw_rx));
 
-    // select - white cable
-    // let mut select_btn = chip.get_line(19).unwrap().request(LineRequestFlags::INPUT, 1, "sel").unwrap();
-    let select_btn_line = chip.get_line(19).unwrap();
-    let select_btn_events = select_btn_line.events(
-        LineRequestFlags::INPUT,
-        EventRequestFlags::FALLING_EDGE,
-        "sel"
-    ).unwrap();
+    // wait for tasks to be ready or something idk, maybe mostly drawing task to init i2c and spi
+    std::thread::sleep(Duration::from_millis(200)); 
 
-    // up - green cable
-    let mut up_btn = CdevPin::new(chip.get_line(13).unwrap().request(LineRequestFlags::INPUT, 1, "up").unwrap()).unwrap();
+    draw_tx.send(DrawCommand::ClearScreen).await.unwrap();
+    std::thread::sleep(Duration::from_millis(200));
 
-    // down - beige cable
-    let mut down_btn = CdevPin::new(chip.get_line(6).unwrap().request(LineRequestFlags::INPUT, 1, "dwn").unwrap()).unwrap();
-    // let mut last_esc_btn_state = escape_btn.is_high().unwrap();
-    // let mut last_sel_btn_state = select_btn.is_high().unwrap();
-    // let mut last_up_btn_state = up_btn.is_high().unwrap();
-    // let mut last_down_btn_state = down_btn.is_high().unwrap();
+    draw_tx.send(DrawCommand::NavigatingBackground { current_dir: current_dir.clone(), file_count: file_count }).await.unwrap();
 
-    // let esc_btn_state = escape_btn.is_high().unwrap();
-    // let sel_btn_state = select_btn.is_high().unwrap();
-    // let up_btn_state = up_btn.is_high().unwrap();
-    // let down_btn_state = down_btn.is_high().unwrap();
-    for event in select_btn_events {
-        let evt = event.unwrap();
-        match evt.event_type() {
-            EventType::FallingEdge => {
-                while let Ok(()) = dball.read_exact(&mut frame) {
-                    let started = Instant::now();
-                    fb_mem[..frame_bytes].copy_from_slice(&frame);
-
-                    let elapsed = started.elapsed();
-                    if elapsed < frame_delay {
-                        thread::sleep(frame_delay - elapsed);
+    // listen for btn presses
+    while let Some(event) = btn_rx.recv().await {
+        let mut current_state = *state.current_state.lock().await;
+        match current_state {
+            DisplayState::Navigating => {
+                match event {
+                    ButtonEvent::Escape => {
+                        // go up dir or show error msg
+                        println!("Clicked escape!");
+                        let res = exit_dir(&state.nav_state, draw_tx.clone()).await;
+                        match res {
+                            Some((path, file_count)) => {
+                                state.nav_state.current_dir = path;
+                                state.nav_state.current_index = 0;
+                                state.nav_state.file_count = file_count;
+                            }
+                            None => {
+                                // show error? idk, maybe use Err(msg) instead
+                            }
+                        }
                     }
+                    ButtonEvent::Select => {
+                        // go into dir or show confirmmediaselection
+                        println!("Clicked Select!");
+                        let res = enter_dir_or_select_file(&state.nav_state, draw_tx.clone()).await;
+                        match res {
+                            SelectResponse::File { file_name, file_size, file_extension, file_path } => {
+                                println!("this file extension is: {}", file_extension);
+                                println!("file size: {}", file_size);
+                                println!("file name: {}", file_name);
+                                let draw_tx = draw_tx.clone();
+                                match file_extension.as_str() {
+                                    "rgb565" | "raw" => {
+                                        draw_tx.send(DrawCommand::ConfirmingBackground { message: format!("Play video: {}?\n\n File size: {}", file_name, file_size), options: vec!["No!".to_string(), "Yes!".to_string()] }).await.unwrap();
+                                        // let current_state = state.current_state.clone(); 
+                                        // let paused = state.video_state.paused.clone();
+                                        // let current_frame = state.video_state.current_frame.clone();
+                                        // state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
+                                        // tokio::spawn(async move {
+                                        //     {
+                                        //         let mut current_state = current_state.lock().await;
+                                        //         *current_state = DisplayState::PlayingSomething;
+                                        //         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                        //         draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+                                        //     }
+                                        //     let mut video_spawned = false;
+                                        //     loop {
+                                        //         match *current_state.lock().await {
+                                        //             DisplayState::ErrorMessage 
+                                        //             | DisplayState::UnrecoverableError 
+                                        //             | DisplayState::ConfirmingMediaExit 
+                                        //             | DisplayState::ConfirmingMediaSelection => continue,
+                                        //             DisplayState::Navigating => break,
+                                        //             DisplayState::PlayingSomething => {
+                                        //                 if video_spawned {
+                                        //                     continue
+                                        //                 }
+                                        //                 else {
+                                        //                     let paused = paused.clone();
+                                        //                     let draw_tx = draw_tx.clone();
+                                        //                     let file_path = file_path.clone();
+                                        //                     let current_frame = current_frame.clone();
+                                        //                     if paused.load(Ordering::Relaxed) == false {
+                                        //                         video_spawned = true;
+                                        //                         tokio::spawn(async move {
+                                        //                             // 2 bytes per pixel btw
+                                        //                             let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                        //                             // 24 fps
+                                        //                             let frame_delay = Duration::from_millis(42);
+                                        //                             // open bgr565le file
+                                        //                             let mut dball = File::open(file_path).unwrap();
+                                        //                             let mut frame = vec![0u8; frame_bytes];
+                                        //
+                                        //                             // start from current frame
+                                        //                             while let Ok(()) = dball.read_exact(&mut frame) {
+                                        //                                 // break if paused
+                                        //                                 if paused.load(Ordering::Relaxed) == true {
+                                        //                                     break
+                                        //                                 }
+                                        //                                 draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                        //                                 tokio::time::sleep(frame_delay).await;
+                                        //                                 current_frame.fetch_add(1, Ordering::Relaxed);
+                                        //                             }
+                                        //                         });
+                                        //                     }
+                                        //                 }
+                                        //             }
+                                        //         }
+                                        //     }
+                                        // });
+                                    }
+                                    _ =>  {
+                                        draw_tx.send(DrawCommand::ConfirmingBackground { message: "Can not currently play this kind of file - handling of different files (such as txt's, and other basic formats) are in development!".to_string(), options: vec!["Okay".to_string()] }).await.unwrap();
+                                    }
+                                }
+                            }
+                            SelectResponse::Directory { file_path, file_count } => {
+                                state.nav_state.current_dir = file_path;
+                                state.nav_state.current_index = 0;
+                                state.nav_state.file_count = file_count;
+                            }
+                            SelectResponse::Error(err_msg) => {
+                            }
+                            SelectResponse::FatalError(err_msg) => {
+                            }
+                        }
+                    }
+                    ButtonEvent::Up => {
+                        // goto prev file
+                        println!("Clicked Up!");
+                        if state.nav_state.file_count > 1 {
+                            if state.nav_state.current_index != 0 {
+                                let draw_tx = draw_tx.clone();
+                                scroll_up(&state.nav_state, draw_tx).await;
+                                state.nav_state.current_index -= 1;
+                            }
+                        }
+                    }
+                    ButtonEvent::Down => {
+                        // goto next file
+                        println!("Clicked Down!");
+                        if state.nav_state.file_count > 1 {
+                            if state.nav_state.current_index != (state.nav_state.file_count - 1) {
+                                let draw_tx = draw_tx.clone();
+                                scroll_down(&state.nav_state, draw_tx).await;
+                                state.nav_state.current_index += 1;
+                            }
+                        }
+                    }
+                    ButtonEvent::TimeChanged => {
+                        {
+                            let current_time = state.current_time.lock().unwrap();
+                            draw_tx.send(DrawCommand::Text { content: current_time.format("%-I:%M%P").to_string(), position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                        }
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        let new_formatted_local_time = new_current_local_time.format("%-I:%M%P").to_string();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                        draw_tx.send(DrawCommand::Text { content: new_formatted_local_time, position: draw::TOP_NAV_CLOCK_TEXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+                    }
+                    ButtonEvent::CurrentFrameChanged => {}
+                }
+            }
+            DisplayState::ConfirmingMediaSelection => {
+                match event {
+                    ButtonEvent::Escape => {
+                        // go back to navigation
+                    }
+                    ButtonEvent::Select => {
+                        // go back or goto playing based on state
+                        if state.modal_state.1 == true {
+                            println!("hello world");
+                            let draw_tx = draw_tx.clone();
+                            tokio::spawn(async move {
+                                let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                // 24 fps
+                                let frame_delay = Duration::from_millis(42);
+                                // open bgr565le file
+                                // change to whatever current file ur on in dir
+                                let mut dball = File::open("/home/yassin/cross_compiled/dragonball/goku_vs_piccolo_jr_le.raw").unwrap();
+                                let mut frame = vec![0u8; frame_bytes];
+                                while let Ok(()) = dball.read_exact(&mut frame) {
+                                    // let started = Instant::now();
+                                    draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                    thread::sleep(frame_delay);
+                                    // let elapsed = started.elapsed();
+                                    // if elapsed < frame_delay {
+                                    //     thread::sleep(frame_delay - elapsed);
+                                    // }
+                                }
+                            });
+                        }
+                    }
+                    ButtonEvent::Up => {
+                        // invert state
+                    }
+                    ButtonEvent::Down => {
+                        // invert state
+                    }
+                    ButtonEvent::TimeChanged => {
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                    }
+                    ButtonEvent::CurrentFrameChanged => {}
+                }
+            }
+            DisplayState::PlayingSomething => {
+                match event {
+                    ButtonEvent::Escape => {
+                        // set confirmingmediaexit state
+                    }
+                    ButtonEvent::Select => {
+                        // pause media
+                    }
+                    ButtonEvent::Up => {
+                        // turn up volume
+                        let volume = state.video_state.volume.load(Ordering::Relaxed);
+                        if volume != 100 {
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: true, screen: true }).await.unwrap();
+                            state.video_state.volume.fetch_add(5, Ordering::Relaxed);
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: false, screen: true }).await.unwrap();
+                        }
+                    }
+                    ButtonEvent::Down => {
+                        // turn down volume
+                        let volume = state.video_state.volume.load(Ordering::Relaxed);
+                        if volume != 0 {
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: true, screen: true }).await.unwrap();
+                            state.video_state.volume.fetch_sub(5, Ordering::Relaxed);
+                            draw_tx.send(DrawCommand::DrawI2CText { content: format!("{}%",state.video_state.volume.load(Ordering::Relaxed).to_string()), position: draw::TOP_VOLUME_VALUE_COORDS, undraw: false, screen: true }).await.unwrap();
+                        }
+                    }
+                    ButtonEvent::TimeChanged => {
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                    }
+                    ButtonEvent::CurrentFrameChanged => {
+                        // draw timestamp to i2c display 2 at point 
+
+                        println!("THE CURRENT FRAME HAS CHANGED");
+                        // let current_frame = state.video_state.current_frame.load(Ordering::Relaxed);
+                        // undraw
+                        draw_tx.send(DrawCommand::DrawI2CText { content: state.video_state.drawn_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: true, screen: true }).await.unwrap();
+                        
+                        // change states
+                        let new_timestamp = utils::format_timecode(state.video_state.current_frame.load(Ordering::Relaxed), state.video_state.total_frames.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64, SCREEN_FPS as u64);
+                        state.video_state.drawn_timestamp = new_timestamp.clone();
+
+                        // draw
+                        draw_tx.send(DrawCommand::DrawI2CText { content: new_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: false, screen: true }).await.unwrap();
+                    }
+                }
+            }
+            DisplayState::ConfirmingMediaExit => {
+                match event {
+                    ButtonEvent::Escape => {
+                        // set current state to prev state
+                    }
+                    ButtonEvent::Select => {
+                        // set current state to either navigating or playingmedia
+                    }
+                    ButtonEvent::Up => {
+                        // invert state
+                    }
+                    ButtonEvent::Down => {
+                        // invert state
+                    }
+                    ButtonEvent::TimeChanged => {
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                    }
+                    ButtonEvent::CurrentFrameChanged => {}
+                    _ => ()
+                }
+            }
+            DisplayState::ErrorMessage => {
+                match event {
+                    ButtonEvent::Select => {
+                        // back to previous_state
+                    }
+                    ButtonEvent::TimeChanged => {
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                    }
+                    ButtonEvent::CurrentFrameChanged => {}
+                    _ => ()
+                }
+            }
+            DisplayState::UnrecoverableError => {
+                match event {
+                    ButtonEvent::Select => {
+                        // shut down device
+                    }
+                    ButtonEvent::TimeChanged => {
+                        let new_current_local_time: DateTime<Local> = Local::now();
+                        {
+                            let mut current_time = state.current_time.lock().unwrap();
+                            *current_time = new_current_local_time;
+                        }
+                    }
+                    ButtonEvent::CurrentFrameChanged => {}
+                    _ => ()
+                }
+            }
+        }
+    }
+    loop {}
+}
+
+async fn button_task(chip_path: &str, gpio_number: u32, mut tx: mpsc::Sender<ButtonEvent>, event_type: ButtonEvent) {
+    let mut chip = Chip::new(chip_path).unwrap();
+    let mut db = debounce_4(false);
+
+    loop {
+        let pressed = tokio::task::spawn_blocking({
+            let handle = chip
+                .get_line(gpio_number)
+                .unwrap()
+                .request(LineRequestFlags::INPUT, 0, "btn")
+                .unwrap();
+            let mut pin = CdevPin::new(handle).unwrap();
+            move || pin.is_low().unwrap()
+        }).await.unwrap();
+
+        if let Some(edge) = db.update(pressed) {
+            if edge == Edge::Rising {
+                tx.send(event_type).await.unwrap();
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+async fn current_time_task(tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateTime<Local>>>, current_state: Arc<tokio::sync::Mutex<DisplayState>>) {
+    loop {
+        match *current_state.lock().await {
+            DisplayState::Navigating => {
+                let new_current_local_time: DateTime<Local> = Local::now();
+                if new_current_local_time != *state.lock().unwrap() {
+                    tx.send(ButtonEvent::TimeChanged).await.unwrap();
                 }
             }
             _ => ()
         }
-        // simple debounce
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    loop {}
+}
+async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, file_size: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+    loop {
+        let paused = paused.load(Ordering::Relaxed);
+        if !paused {
+            let current_frame = current_frame.load(Ordering::Relaxed);
+            let total_frames = file_size.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64;
+            // send timestamp changed
+            if current_frame > 0 && current_frame % 24 == 0 && current_frame != total_frames {
+                tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
+                println!("CURRENT FRAME HAS CHANGED, SENDING FROM THE TASk");
+            }
+            tokio::time::sleep(Duration::from_millis(42)).await;
+        }
+    }
+}
 
-    // For an ILI9341 with fbtft, expect width=240, height=320, bpp=2 and RGB565 layout
-    // println!("Framebuffer: {}×{} at {} bytes/pixel", width, height, bpp);
-    // println!("Format: {:?}", fb.get_pixel_layout());
 
-    // double buffer, apparently driver supports automatic flipping.
-    // let mut buf = linuxfb::double::Buffer::new(fb).unwrap();
-    // let w = buf.width as usize;
-    // let h = buf.height as usize;
-    // let frame_bytes = w * h * bpp * 2;
+// drawtarget impl for framebufferdisplay
+struct FramebufferDisplay<'a> {
+    buf: &'a mut [u8],
+    width: usize,
+    height: usize,
+}
 
-    // let mut spi_dev = SpidevDevice::open("/dev/spidev0.0").unwrap();
-    // let options = SpidevOptions::new()
-    //     .bits_per_word(8)
-    //     .max_speed_hz(40_000_000)
-    //     .mode(SpiModeFlags::SPI_MODE_0)
-    //     .build();
-    // spi_dev.configure(&options).unwrap();
+impl<'a> OriginDimensions for FramebufferDisplay<'a> {
+    fn size(&self) -> Size {
+        Size::new(self.width as u32, self.height as u32)
+    }
+}
+impl <'a> DrawTarget for FramebufferDisplay<'a> {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
 
-    // spi interface
-    // let cs_output = CdevPin::new(chip.get_line(8).unwrap().request(LineRequestFlags::OUTPUT, 1, "cs_output").unwrap()).unwrap();
-    // let spi_device = ExclusiveDevice::new(spi, cs_output, delay).unwrap();
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+        I: IntoIterator<Item = Pixel<Self::Color>> 
+    {
+        for Pixel(coord, color) in pixels {
+            if coord.x >= 0 && coord.x < self.width as i32 && coord.y >= 0 && coord.y < self.height as i32 {
+                // 2 bytes per pixel (rgb565)
+                let idx = (coord.y as usize * self.width + coord.x as usize) * 2;
+                let mut value = color.into_storage();
+                // rgb => bgr
+                let red = (value >> 11) & 0x1F;
+                let green = (value >> 5) & 0x3F;
+                let blue = value & 0x1F;
+                let swapped = (blue << 11) | (green << 5) | red;
 
-    // let mut buffer = [0_u8; 1024];
-    // let di = SpiInterface::new(spi_dev, dc, &mut buffer);
-    //
-    // //green led
-    // let green_led = chip.get_line(2).unwrap().request(LineRequestFlags::OUTPUT, 0, "blinky").unwrap();
-    //
-    // let mut display = Builder::new(ILI9341Rgb565, di)
-    //     .reset_pin(rst)
-    //     // .orientation(Orientation { mirrored: true, rotation: Rotation::Deg270 })
-    //     // .color_order(mipidsi::options::ColorOrder::Bgr)
-    //     .init(&mut delay)
-    //     .unwrap();
-    // display.clear(Rgb565::BLACK).unwrap();
+                let rgb = swapped.swap_bytes().to_be_bytes();
+                self.buf[idx] = rgb[0];
+                self.buf[idx + 1] = rgb[1];
+            }
+        }
+        Ok(())
+    }
+}
 
+enum DrawCommand {
+    // happens after selecting or exiting
+    ConfirmingBackground {
+        message: String,
+        options: Vec<String>
+    },
+    // draw rect on top, 3 rects in middle/bottom for file icon, and file name after state change
+    // to navigating
+    NavigatingBackground {
+        current_dir: PathBuf,
+        file_count: usize,
+    },
+    // text only happens when navigatingbackground has been sent and state has changed to
+    // navigating
+    Text {
+        content: String,
+        position: Point,
+        undraw: bool,
+        is_selected: bool,
+    },
+    RawFrame {
+        data: Vec<u8>,
+    },
+    ClearScreen,
+    DrawI2CText {
+        content: String,
+        position: Point,
+        undraw: bool,
+        screen: bool,
+    },
+    ClearI2CScreen(bool),
+}
+// to be used for video/music playback me thinks
+enum ControlCommand {
+    Stop,
+    Pause,
+    Resume,
+}
+// light background, dark text
+fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Vec<String>) {
+    
+    clear_screen(fb);
+
+    // add error msg, line break every 30 characters, map options on bottom spaced based on len
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let modal_style = PrimitiveStyleBuilder::new()
+        .stroke_width(2)
+        .stroke_color(Rgb565::WHITE)
+        .build();
+
+    // border of modal
+    Rectangle::new(Point::new(40, 40), Size::new(240, 160))
+        .into_styled(modal_style)
+        .draw(&mut display)
+        .unwrap();
+
+    let mut formatted_msg = String::new();
+    for (index, character) in msg.chars().enumerate() {
+        formatted_msg += character.to_string().as_str();
+        if (index + 1) % 25 == 0 && (index + 1) != msg.len() {
+            formatted_msg += "\n";
+        }
+    }
+
+    // parse msg, break it every 25 chars
+    let txt_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+    Text::with_baseline(formatted_msg.as_str(), Point::new(60, 60), txt_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+
+    // options
+    let option_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_SKY_BLUE)
+        .build();
+
+    // 6 padding on left, 4 on top
+    let num_of_options = options.iter().count();
+    if num_of_options == 1 {
+        // "okay" option
+        Rectangle::new(Point::new(140, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("Okay!", Point::new(146, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    else if num_of_options == 2 {
+        // no option
+        Rectangle::new(Point::new(110, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("No!", Point::new(116, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        // border of modal
+        // yes option
+        Rectangle::new(Point::new(170, 110), Size::new(40, 20))
+            .into_styled(option_style)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline("Yes!", Point::new(176, 114), txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    // else if num_of_options == 3 {
     //
-    // loop {
-    //     let start = Instant::now();
+    // }
+    // else {
     //
-    //
-    //     // block until full frame is read
-    //     if let Err(e) = dball.read_exact(&mut raw) {
-    //         eprintln!("EOF or error reading frame: {:?}", e);
-    //         loop {
-    //         }
-    //     }
-    //
-    //     // draw to back to buffer
-    //     let back = buf.as_mut_slice();
-    //     back.copy_from_slice(&raw);
-    //
-    //     // show frame
-    //     buf.flip().unwrap();
-    //
-    //     // maintain timing
-    //     let elapsed = start.elapsed();
-    //     if elapsed < frame_delay {
-    //         thread::sleep(frame_delay - elapsed);
-    //     }
-    //
-    //     // let bytes_read = dball.read(frame_buffer).unwrap();
-    //     //
-    //     // let raw_frame: ImageRaw<Rgb565> = ImageRaw::<Rgb565>::new(frame_buffer, WIDTH as u32);
-    //     // let frame = Image::new(&raw_frame, Point::zero());
-    //     // frame.draw(&mut display).unwrap();
-    //     //
-    //     // if bytes_read < FRAME_SIZE {
-    //     //     continue;
-    //     // }
-    //     // green_led.set_value(1).unwrap();
-    //     // sleep(Duration::from_secs(1));
-    //     // green_led.set_value(0).unwrap();
-    //     // sleep(Duration::from_secs(1));
     // }
 }
+fn undraw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_width(3)
+        .stroke_color(Rgb565::BLACK)
+        .fill_color(Rgb565::BLACK)
+        .build();
+
+    Rectangle::new(Point::new(10, height as i32 / 2), Size::new(40, 20))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+// top rect, and 3 middle rects spaced out by 10px
+fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: PathBuf, file_count: usize) {
+    // wipe screen first TODO()
+    clear_screen(fb);
+
+    // draw when transitioning to navigating state
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+
+    // top nav rectangle
+    let nav_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::WHITE)
+        .build();
+
+    let selected_style = PrimitiveStyleBuilder::new()
+        .stroke_width(2)
+        .stroke_color(Rgb565::CSS_SKY_BLUE)
+        .build();
+
+    let carousel_style = PrimitiveStyleBuilder::new()
+        .stroke_width(2)
+        .stroke_color(Rgb565::CSS_LIGHT_BLUE)
+        .build();
+
+    // top meta
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::TOP_NAV_BG_COORDS, Size::new(300, 40)),
+        Size::new(10, 10),
+    )
+    .into_styled(nav_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // carousel 
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::CAROUSEL_CONTAINER_BG_COORDS, Size::new(270, 140)),
+        Size::new(12, 12),
+    )
+    .into_styled(carousel_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // selected item in carousel
+    RoundedRectangle::with_equal_corners(
+        Rectangle::new(draw::MIDDLE_CAROUSEL_BG_COORDS, Size::new(250, 40)),
+        Size::new(12, 12),
+    )
+    .into_styled(selected_style)
+    .draw(&mut display)
+    .unwrap();
+
+    // add nav images on top. (folder, temperature, time icons)
+    draw::draw_folder(&mut display, width, height, Point::new(14, 10));
+    draw::draw_cloud(&mut display, width, height, Point::new(150, 10));
+    draw::draw_clock(&mut display, width, height, Point::new(220, 10));
+
+    // current path, file_count, and current file navigated on (index of files of dir)
+    let txt_style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
+    // current_dir
+    Text::with_baseline(format_dir(current_dir.to_owned()).as_str(), draw::TOP_NAV_PATH_COORDS, txt_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+
+    // file_count
+    if file_count == 0 {
+        Text::with_baseline(format!("0/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    else {
+        Text::with_baseline(format!("1/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+
+    // middle and bottom carousel (index 0/1 if exists?)
+
+    Text::with_baseline(format!("1/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+    let readdir: Vec<_> = std::fs::read_dir(current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let current_idx = readdir.get(0);
+    let idx_plus_one = readdir.get(1);
+
+    if let Some(current_idx) = current_idx {
+        Text::with_baseline(current_idx.file_name().to_str().unwrap(), draw::MIDDLE_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        Text::with_baseline(idx_plus_one.file_name().to_str().unwrap(), draw::BOTTOM_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+
+    // THESE ALL SHOULD PROBABLY BE HAND DRAWN, GPT5 CANT DRAW ICONS FOR SHIT LOL
+    // draw::draw_camera(fb, width, height, Point::new(40, 100));
+    // draw::draw_file(fb, width, height, Point::new(65, 100));
+    // draw::draw_paused(fb, width, height, Point::new(80, 100));
+    // draw::draw_volume(fb, width, height, Point::new(105, 100));
+    // draw::draw_playing(fb, width, height, Point::new(130, 100));
+    // draw::draw_question_mark(fb, width, height, Point::new(155, 100));
+
+}
+fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+    // undraw when leaving navigating state
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = PrimitiveStyleBuilder::new()
+        .stroke_width(3)
+        .stroke_color(Rgb565::WHITE)
+        .fill_color(Rgb565::WHITE)
+        .build();
+
+    Rectangle::new(point, Size::new(width as u32, height as u32))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+
+fn draw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
+
+    Text::with_baseline(msg, point, style, Baseline::Top)
+        .draw(&mut display)
+        .unwrap();
+}
+fn undraw_text(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point, is_selected: bool) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    if is_selected {
+        let style = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_DARK_GRAY);
+
+        Text::with_baseline(msg, point, style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+    else {
+        let style = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_DARK_GRAY);
+
+        Text::with_baseline(msg, point, style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
+}
+fn clear_screen(fb: &mut [u8]) {
+    let mut display = FramebufferDisplay { buf: fb, width: 320, height: 240 };
+
+    let style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::CSS_DARK_GRAY)
+        .build();
+    Rectangle::new(Point::zero(), Size::new(320, 240))
+        .into_styled(style)
+        .draw(&mut display)
+        .unwrap();
+}
+
+fn draw_raw_frame(fb: &mut [u8], frame_data: &[u8]) {
+    fb.copy_from_slice(frame_data);
+}
+fn format_dir(current_dir: PathBuf) -> String {
+    let string = current_dir.to_str().unwrap().to_owned();
+    let mut formatted = string.replace("/yassin", "");
+    if formatted.len() > 40 {
+        formatted.replace_range(40..=formatted.len() - 1, "...");
+        formatted
+    }
+    else {
+        formatted
+    }
+}
+async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
+    tokio::task::spawn_blocking(move || {
+        // spi
+        let fb = Framebuffer::new("/dev/fb1").expect("Failed to open framebuffer");
+        let width = fb.get_size().0 as usize;
+        let height = fb.get_size().1 as usize;
+        let bpp = fb.get_bytes_per_pixel() as usize;
+
+        let mut mapped = fb.map().expect("Failed to map framebuffer memory");
+
+
+
+        // two i2c screens, initialize and default draws - not storing values after shutdown atm
+        let i2c_screen1_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-1").unwrap();
+        let i2c_screen2_dev = linux_embedded_hal::I2cdev::new("/dev/i2c-2").unwrap();
+
+        let i2c_screen1_interface = I2CDisplayInterface::new(i2c_screen1_dev);
+        let mut i2c_screen1_display = Ssd1306::new(i2c_screen1_interface, DisplaySize128x32, DisplayRotation::Rotate0)
+            .into_buffered_graphics_mode();
+
+        i2c_screen1_display.init().unwrap();
+        i2c_screen1_display.clear_buffer();
+        i2c_screen1_display.flush().unwrap();
+
+        let i2c_screen2_interface = I2CDisplayInterface::new(i2c_screen2_dev);
+        let mut i2c_screen2_display = Ssd1306::new(i2c_screen2_interface, DisplaySize128x32, DisplayRotation::Rotate0)
+            .into_buffered_graphics_mode();
+
+        i2c_screen2_display.init().unwrap();
+        i2c_screen2_display.clear_buffer();
+        i2c_screen2_display.flush().unwrap();
+
+        let text_style = MonoTextStyleBuilder::new()
+            .font(&FONT_8X13)
+            .text_color(BinaryColor::On)
+            .build();
+
+        Text::with_baseline("Navigating", draw::DISPLAYSTATE_COORDS, text_style, Baseline::Top)
+            .draw(&mut i2c_screen1_display)
+            .unwrap();
+        i2c_screen1_display.flush().unwrap();
+
+        Text::with_baseline("0:00 / 0:00", draw::TOP_MEDIA_TIMESTAMP_COORDS, text_style, Baseline::Top)
+            .draw(&mut i2c_screen2_display)
+            .unwrap();
+        i2c_screen2_display.flush().unwrap();
+
+        Text::with_baseline(format!("Volume: 0%").as_str(), Point::new(0, 20), text_style, Baseline::Top)
+            .draw(&mut i2c_screen2_display)
+            .unwrap();
+        i2c_screen2_display.flush().unwrap();
+
+        while let Some(cmd) = draw_rx.blocking_recv() {
+            match cmd {
+                DrawCommand::Text { content, position, undraw, is_selected } => {
+                    if undraw {
+                        undraw_text(&mut mapped, width, height, content.as_str(), position, is_selected);
+                    }
+                    else {
+                        draw_text(&mut mapped, width, height, content.as_str(), position);
+                    }
+                },
+                DrawCommand::ConfirmingBackground { message, options } => {
+                    draw_modal(&mut mapped, width, height, &message, options);
+                },
+        // current dir, 
+                DrawCommand::NavigatingBackground { current_dir, file_count } => {
+                    draw_nav_background(&mut mapped, width, height, current_dir, file_count);
+                }
+                DrawCommand::RawFrame { data } => {
+                    draw_raw_frame(&mut mapped, &data);
+                },
+                DrawCommand::ClearScreen => {
+                    clear_screen(&mut mapped);
+                }
+                DrawCommand::DrawI2CText { content, position, undraw, screen } => {
+                    if screen == false {
+                        if undraw {
+                            undraw_i2c_text(&mut i2c_screen1_display, content.as_str(), position);
+                        }
+                        else {
+                            draw_i2c_text(&mut i2c_screen1_display, content.as_str(), position);
+                        }
+                    }
+                    else {
+                        if undraw {
+                            undraw_i2c_text(&mut i2c_screen2_display, content.as_str(), position);
+                        }
+                        else {
+                            draw_i2c_text(&mut i2c_screen2_display, content.as_str(), position);
+                        }
+                    }
+                }
+                DrawCommand::ClearI2CScreen (screen) => {
+                    // screen 1
+                    if screen == false {
+                        clear_i2c_screen(&mut i2c_screen1_display);
+                    }
+                    // screen 2
+                    else {
+                        clear_i2c_screen(&mut i2c_screen2_display);
+                    }
+                }
+                _ => ()
+                // DrawCommand::DrawI2CText { content, position, undraw } => {
+                //     if undraw {
+                //         undraw_text(&mut mapped, width, height, content.as_str(), position);
+                //     }
+                //     else {
+                //         draw_text(&mut mapped, width, height, content.as_str(), position);
+                //     }
+                // }
+            }
+        }
+    });
+}
+
+fn draw_i2c_text(
+    display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>,
+    content: &str,
+    point: Point
+) {
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::with_baseline(content, point, style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+    display.flush().unwrap();
+}
+fn undraw_i2c_text(
+    display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>,
+    content: &str,
+    point: Point,
+) {
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13)
+        .text_color(BinaryColor::Off)
+        .build();
+
+    Text::with_baseline(content, point, style, Baseline::Top)
+        .draw(display)
+        .unwrap();
+    display.flush().unwrap();
+}
+fn clear_i2c_screen(display: &mut Ssd1306<I2CInterface<I2cdev>, DisplaySize128x32, BufferedGraphicsMode<DisplaySize128x32>>) {
+    display.clear_buffer();
+    display.flush().unwrap();
+}
+
+
+// do nothing len 0/1
+// determine where in iteration u are, so that u can undraw and draw if there is index-1, and index+1/index+2, or vice versa
+// can animate these in future
+async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
+
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+    let idx_minus_two = { if nav_state.current_index == 0 || nav_state.current_index == 1 { None } else { readdir.get(nav_state.current_index - 2) } };
+
+    // undraw based on indexes available
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+
+    // draw indexes based on new upcoming states
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(idx_minus_two) = idx_minus_two {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+
+    // undraw and draw the new current index
+    // draw_tx.send(DrawCommand::Text { content: format!("1/{}", file_count), position: Point::new(46, 18), undraw: false, is_selected: false }).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+}
+async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) {
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let idx_plus_two = readdir.get(nav_state.current_index + 2);
+
+    // undraw based on indexes available
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+
+    // draw indexes based on new upcoming states
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(idx_plus_two) = idx_plus_two {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_two.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 2, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+}
+enum SelectResponse {
+    // (file type, file size, file name)
+    File {
+        file_name: String,
+        file_size: u64,
+        file_extension: String,
+        file_path: PathBuf,
+    },
+    Directory{
+        file_path: PathBuf,
+        file_count: usize,
+    },
+    Error(String),
+    FatalError(String),
+}
+
+async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> SelectResponse {
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+
+    if let Some(entry) = readdir.get(nav_state.current_index) {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_dir() {
+                let new_dir: Vec<_> = std::fs::read_dir(entry.path()).unwrap().collect::<Result<_, _>>().unwrap();
+                // undraw the current current_index/file_count,
+                draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                draw_tx.send(DrawCommand::Text { content: format_dir(nav_state.current_dir.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+
+                // undraw possible idx_plus_one, current_idx, and idx_minus_one
+                if let Some(idx_plus_one) = idx_plus_one {
+                    draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                }
+                if let Some(current_idx) = current_idx {
+                    draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
+                }
+                if let Some(idx_minus_one) = idx_minus_one {
+                    draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+                }
+
+                // new path is the one u selected, draw their stuff if exists
+                let file_count = new_dir.iter().count();
+                let new_current_idx = new_dir.get(0);
+                let new_idx_plus_one = new_dir.get(1);
+
+                if file_count == 0 {
+                    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 0, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+                }
+                else {
+                    draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 1, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+                }
+                if let Some(new_idx_plus_one) = new_idx_plus_one {
+                    draw_tx.send(DrawCommand::Text { content: new_idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+                }
+                if let Some(new_current_idx) = new_current_idx {
+                    draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
+                }
+                draw_tx.send(DrawCommand::Text { content: format_dir(entry.path().to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+                SelectResponse::Directory { file_path: entry.path(), file_count: file_count } 
+            }
+            else if meta.is_file() {
+                // check extension
+                // if .raw or .rgb565, prompt to play
+
+                // for now, just play
+                println!("This is a file!");
+                let path = entry.path();
+                let file_extension = path.extension();
+                if let Some(file_extension) = file_extension {
+                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len(), file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path }
+                }
+                else {
+                    SelectResponse::Error(String::from("Filetype error: File can not be opened: must be either a .mp3, rgb565, or .raw file."))
+                }
+            }
+            else {
+                SelectResponse::Error(String::from("Filetype error: File can not be opened: must be either a .mp3, rgb565, or .raw file."))
+            }
+        }
+        else {
+                SelectResponse::Error(String::from("Unknown error: File could not be opened."))
+        }
+    }
+    else {
+        SelectResponse::Error(String::from("There are no files or directories in this path."))
+    }
+}
+
+async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>) -> Option<(PathBuf, usize)> {
+    let readdir: Vec<_> = std::fs::read_dir(nav_state.current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    let idx_plus_one = readdir.get(nav_state.current_index + 1);
+    let current_idx = readdir.get(nav_state.current_index);
+    let idx_minus_one = { if nav_state.current_index == 0 { None } else { readdir.get(nav_state.current_index - 1) } };
+
+    // undraw the current current_index/file_count,
+    if nav_state.file_count == 0 {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 0, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    else {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    draw_tx.send(DrawCommand::Text { content: format_dir(nav_state.current_dir.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    // if there are files or dirs, undraw them
+    if let Some(idx_plus_one) = idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+    if let Some(current_idx) = current_idx {
+        draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
+    }
+    if let Some(idx_minus_one) = idx_minus_one {
+        draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
+    }
+
+    // go up one in current directory
+    let mut new_path = nav_state.current_dir.to_owned();
+    new_path.pop();
+    let new_dir: Vec<_> = std::fs::read_dir(new_path.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
+    println!("new directory: {:#?}", new_dir);
+    let file_count = new_dir.iter().count();
+    let new_current_idx = new_dir.get(0);
+    let new_idx_plus_one = new_dir.get(1);
+
+    if file_count == 0 {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 0, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    else {
+        draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 1, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(new_idx_plus_one) = new_idx_plus_one {
+        draw_tx.send(DrawCommand::Text { content: new_idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    }
+    if let Some(new_current_idx) = new_current_idx {
+        draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
+    }
+    draw_tx.send(DrawCommand::Text { content: format_dir(new_path.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
+    Some((new_path, file_count))
+}
+
+
+
