@@ -59,8 +59,12 @@ struct State {
 struct ModalState {
     message: String,
     selected: u8,
+    file: Option<FileDetails>,
+}
+#[derive(Clone)]
+struct FileDetails {
     file_path: PathBuf,
-    file_size: usize,
+    file_size: u64,
     file_name: String,
     file_extension: String,
 }
@@ -242,13 +246,13 @@ async fn main() -> ! {
                         let res = enter_dir_or_select_file(&state.nav_state, draw_tx.clone()).await;
                         match res {
                             SelectResponse::File { file_name, file_size, file_extension, file_path } => {
-                                state.modal_state = Some(ModalState { message: (), selected: (), file_path: (), file_size: (), file_name: (), file_extension: () })
                                 println!("this file extension is: {}", file_extension);
                                 println!("file size: {}", file_size);
                                 println!("file name: {}", file_name);
                                 let draw_tx = draw_tx.clone();
                                 match file_extension.as_str() {
                                     "rgb565" | "raw" => {
+                                        state.modal_state = Some(ModalState { message: format!("Play video: {}?", file_name), selected: 0, file: Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone() })});
                                         state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
                                         {
                                             let current_state = state.current_state.clone();
@@ -260,6 +264,7 @@ async fn main() -> ! {
                                         draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
                                     }
                                     _ =>  {
+                                        state.modal_state = Some(ModalState { message: "Can not currently play this kind of file - handling of different files (such as txt's, and other basic formats) are in development!".to_string(), selected: 0, file:Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone() })});
                                         {
                                             let current_state = state.current_state.clone();
                                             let mut current_state = current_state.lock().await;
@@ -277,6 +282,7 @@ async fn main() -> ! {
                                 state.nav_state.file_count = file_count;
                             }
                             SelectResponse::Error(err_msg) => {
+                                state.modal_state = Some(ModalState { message: err_msg.clone(), selected: 0, file: None });
                                 {
                                     let current_state = state.current_state.clone();
                                     let mut current_state = current_state.lock().await;
@@ -292,6 +298,7 @@ async fn main() -> ! {
                                     let mut current_state = current_state.lock().await;
                                     *current_state = DisplayState::UnrecoverableError;
                                 }
+                                state.modal_state = Some(ModalState { message: fatal_err_msg.clone(), selected: 0, file: None });
                                 draw_tx.send(DrawCommand::ConfirmingBackground { message: fatal_err_msg, options: vec!["Okay".to_string()] }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "FATAL ERROR!!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
@@ -346,13 +353,16 @@ async fn main() -> ! {
                             *current_state = DisplayState::Navigating;
                         }
                         // set modal state to none here if u want idk
+                        if let Some(modal_state) = &mut state.modal_state {
+                            modal_state.selected = 0;
+                        }
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
                         draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                     }
                     ButtonEvent::Select => {
                         // go back or goto playing based on state
-                        if let Some(modal_state) = state.modal_state.clone() {
+                        if let Some(modal_state) = &mut state.modal_state {
                             if modal_state.selected == 0 {
                                 {
                                     let current_state = state.current_state.clone();
@@ -374,36 +384,39 @@ async fn main() -> ! {
                                     let mut current_state = current_state.lock().await;
                                     *current_state = DisplayState::PlayingSomething;
                                 }
-                                draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
                                 let paused = paused.clone();
                                 let draw_tx = draw_tx.clone();
-                                let file_path = modal_state.file_path.clone();
+                                let file_details = modal_state.file.clone();
                                 let current_frame = current_frame.clone();
                                 tokio::spawn(async move {
-                                    // 2 bytes per pixel btw
-                                    let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+                                    if let Some(file_details) = file_details {
+                                        // 2 bytes per pixel btw
+                                        let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
 
-                                    // 24 fps
-                                    let frame_delay = Duration::from_millis(42);
+                                        // 24 fps
+                                        let frame_delay = Duration::from_millis(42);
 
-                                    // open bgr565le file
-                                    // start from current frame, so dball would be with an offset
-                                    let mut dball = File::open(file_path).unwrap();
-                                    let mut frame = vec![0u8; frame_bytes];
+                                        // open bgr565le file
+                                        // start from current frame, so dball would be with an offset
+                                        let mut dball = File::open(file_details.file_path).unwrap();
+                                        let mut frame = vec![0u8; frame_bytes];
 
-                                    // start from current frame
-                                    while let Ok(()) = dball.read_exact(&mut frame) {
-                                        // break if paused
-                                        if paused.load(Ordering::Relaxed) == true {
-                                            break;
+                                        // start from current frame
+                                        while let Ok(()) = dball.read_exact(&mut frame) {
+                                            // break if paused
+                                            if paused.load(Ordering::Relaxed) == true {
+                                                break;
+                                            }
+                                            draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                                            tokio::time::sleep(frame_delay).await;
+                                            current_frame.fetch_add(1, Ordering::Relaxed);
                                         }
-                                        draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
-                                        tokio::time::sleep(frame_delay).await;
-                                        current_frame.fetch_add(1, Ordering::Relaxed);
                                     }
                                 });
                             }
+                            modal_state.selected = 0;
                         }
                     }
                     ButtonEvent::Up => {
@@ -436,6 +449,12 @@ async fn main() -> ! {
                             let current_state = state.current_state.clone();
                             let mut current_state = current_state.lock().await;
                             *current_state = DisplayState::ConfirmingMediaExit;
+                        }
+                        if let Some(modal_state) = &mut state.modal_state {
+                            modal_state.selected = 0;
+                        }
+                        else {
+                            state.modal_state = Some(ModalState { message: "Exit to navigation menu?".to_string(), selected: 0, file: None });
                         }
                         draw_tx.send(DrawCommand::ConfirmingBackground { message: format!("Exit to navigation menu?"), options: vec!["No!".to_string(), "Yes!".to_string()] }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
@@ -489,16 +508,44 @@ async fn main() -> ! {
             DisplayState::ConfirmingMediaExit => {
                 match event {
                     ButtonEvent::Escape => {
-                        // set current state to prev state
+                        // resume video TODO!()
+                        if let Some(modal_state) = &mut state.modal_state {
+                            modal_state.selected = 0;
+                        }
                     }
                     ButtonEvent::Select => {
                         // set current state to either navigating or playingmedia
+                        if let Some(modal_state) = &mut state.modal_state {
+                            if modal_state.selected == 0 {
+                                // resume video TODO!()
+                            }
+                            else if modal_state.selected == 1 {
+                                // go back to navigation
+                                {
+                                    let current_state = state.current_state.clone();
+                                    let mut current_state = current_state.lock().await;
+                                    *current_state = DisplayState::Navigating;
+                                }
+                                modal_state.selected = 0;
+                                draw_tx.send(DrawCommand::DrawI2CText { content: "Exit media?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+                                draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
+                            }
+                        }
                     }
                     ButtonEvent::Up => {
                         // invert state
+                        if let Some(modal_state) = &mut state.modal_state {
+                            modal_state.selected = 0;
+                            draw_tx.send(DrawCommand::SelectNo).await.unwrap();
+                        }
                     }
                     ButtonEvent::Down => {
                         // invert state
+                        if let Some(modal_state) = &mut state.modal_state {
+                            modal_state.selected = 1;
+                            draw_tx.send(DrawCommand::SelectYes).await.unwrap();
+                        }
                     }
                     ButtonEvent::TimeChanged => {
                         let new_current_local_time: DateTime<Local> = Local::now();
@@ -771,10 +818,6 @@ fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Ve
             .unwrap();
 
         // yes option
-        Rectangle::new(draw::MODAL_YES_BORDER_COORDS, Size::new(40, 20))
-            .into_styled(option_style)
-            .draw(&mut display)
-            .unwrap();
         Text::with_baseline("Yes!", Point::new(176, 164), txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
