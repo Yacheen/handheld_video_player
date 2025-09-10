@@ -203,7 +203,7 @@ async fn main() -> ! {
     draw_tx.send(DrawCommand::ClearScreen).await.unwrap();
     std::thread::sleep(Duration::from_millis(200));
 
-    draw_tx.send(DrawCommand::NavigatingBackground { current_dir: current_dir.clone(), file_count: file_count }).await.unwrap();
+    draw_tx.send(DrawCommand::NavigatingBackground { current_dir: current_dir.clone(), file_count: file_count, current_index: state.nav_state.current_index }).await.unwrap();
 
     // listen for btn presses
     while let Some(event) = btn_rx.recv().await {
@@ -242,6 +242,7 @@ async fn main() -> ! {
                         let res = enter_dir_or_select_file(&state.nav_state, draw_tx.clone()).await;
                         match res {
                             SelectResponse::File { file_name, file_size, file_extension, file_path } => {
+                                state.modal_state = Some(ModalState { message: (), selected: (), file_path: (), file_size: (), file_name: (), file_extension: () })
                                 println!("this file extension is: {}", file_extension);
                                 println!("file size: {}", file_size);
                                 println!("file name: {}", file_name);
@@ -347,7 +348,7 @@ async fn main() -> ! {
                         // set modal state to none here if u want idk
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count }).await.unwrap();
+                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                     }
                     ButtonEvent::Select => {
                         // go back or goto playing based on state
@@ -361,7 +362,7 @@ async fn main() -> ! {
                                 // set modal state to none here if u want idk
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                                draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count }).await.unwrap();
+                                draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                             }
                             else if modal_state.selected == 1 {
                                 println!("hello world");
@@ -408,11 +409,13 @@ async fn main() -> ! {
                     ButtonEvent::Up => {
                         if let Some(modal_state) = &mut state.modal_state {
                             modal_state.selected = 0;
+                            draw_tx.send(DrawCommand::SelectNo).await.unwrap();
                         }
                     }
                     ButtonEvent::Down => {
                         if let Some(modal_state) = &mut state.modal_state {
                             modal_state.selected = 1;
+                            draw_tx.send(DrawCommand::SelectYes).await.unwrap();
                         }
                     }
                     ButtonEvent::TimeChanged => {
@@ -520,7 +523,7 @@ async fn main() -> ! {
                         // set modal state to none here if u want idk
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Error! x_x".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count }).await.unwrap();
+                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                     }
                     ButtonEvent::Select => {
                         // go back to navigating
@@ -532,7 +535,7 @@ async fn main() -> ! {
                         // set modal state to none here if u want idk
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Error! x_x".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Navigating".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count }).await.unwrap();
+                        draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                     }
                     ButtonEvent::TimeChanged => {
                         let new_current_local_time: DateTime<Local> = Local::now();
@@ -671,6 +674,7 @@ enum DrawCommand {
     NavigatingBackground {
         current_dir: PathBuf,
         file_count: usize,
+        current_index: usize,
     },
     // text only happens when navigatingbackground has been sent and state has changed to
     // navigating
@@ -691,6 +695,8 @@ enum DrawCommand {
         screen: bool,
     },
     ClearI2CScreen(bool),
+    SelectYes,
+    SelectNo,
 }
 // to be used for video/music playback me thinks
 enum ControlCommand {
@@ -756,21 +762,20 @@ fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Ve
     }
     else if num_of_options == 2 {
         // no option
-        Rectangle::new(Point::new(110, 110), Size::new(40, 20))
+        Rectangle::new(draw::MODAL_NO_BORDER_COORDS, Size::new(40, 20))
             .into_styled(option_style)
             .draw(&mut display)
             .unwrap();
-        Text::with_baseline("No!", Point::new(116, 114), txt_style, Baseline::Top)
+        Text::with_baseline("No!", Point::new(116, 164), txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
 
-        // border of modal
         // yes option
-        Rectangle::new(Point::new(170, 110), Size::new(40, 20))
+        Rectangle::new(draw::MODAL_YES_BORDER_COORDS, Size::new(40, 20))
             .into_styled(option_style)
             .draw(&mut display)
             .unwrap();
-        Text::with_baseline("Yes!", Point::new(176, 114), txt_style, Baseline::Top)
+        Text::with_baseline("Yes!", Point::new(176, 164), txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
     }
@@ -780,6 +785,46 @@ fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Ve
     // else {
     //
     // }
+}
+fn select_yes(fb: &mut [u8], width: usize, height: usize) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let selected_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_SKY_BLUE)
+        .build();
+    let clear_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_DARK_GRAY)
+        .build();
+
+    Rectangle::new(draw::MODAL_YES_BORDER_COORDS, Size::new(40, 20))
+        .into_styled(selected_style)
+        .draw(&mut display)
+        .unwrap();
+    Rectangle::new(draw::MODAL_NO_BORDER_COORDS, Size::new(40, 20))
+        .into_styled(clear_style)
+        .draw(&mut display)
+        .unwrap();
+}
+fn select_no(fb: &mut [u8], width: usize, height: usize) {
+    let mut display = FramebufferDisplay { buf: fb, width, height };
+    let selected_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_SKY_BLUE)
+        .build();
+    let clear_style = PrimitiveStyleBuilder::new()
+        .stroke_width(1)
+        .stroke_color(Rgb565::CSS_DARK_GRAY)
+        .build();
+
+    Rectangle::new(draw::MODAL_YES_BORDER_COORDS, Size::new(40, 20))
+        .into_styled(clear_style)
+        .draw(&mut display)
+        .unwrap();
+    Rectangle::new(draw::MODAL_NO_BORDER_COORDS, Size::new(40, 20))
+        .into_styled(selected_style)
+        .draw(&mut display)
+        .unwrap();
 }
 // fn undraw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str) {
 //     let mut display = FramebufferDisplay { buf: fb, width, height };
@@ -796,7 +841,7 @@ fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Ve
 //         .unwrap();
 // }
 // top rect, and 3 middle rects spaced out by 10px
-fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: PathBuf, file_count: usize) {
+fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: PathBuf, file_count: usize, current_index: usize) {
     // wipe screen first TODO()
     clear_screen(fb);
 
@@ -871,15 +916,17 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: 
             .unwrap();
     }
 
-    // middle and bottom carousel (index 0/1 if exists?)
-
-    Text::with_baseline(format!("1/{}", file_count).as_str(), draw::TOP_NAV_FILE_INDEX_COORDS, txt_style, Baseline::Top)
-        .draw(&mut display)
-        .unwrap();
+    // get idx, idx - 1, and idx + 1, if exists, draw in appropriate spots.
     let readdir: Vec<_> = std::fs::read_dir(current_dir.to_owned()).unwrap().collect::<Result<_, _>>().unwrap();
-    let current_idx = readdir.get(0);
-    let idx_plus_one = readdir.get(1);
+    let idx_minus_one = { if current_index == 0 { None } else { readdir.get(current_index - 1) } };
+    let current_idx = readdir.get(current_index);
+    let idx_plus_one = readdir.get(current_index + 1);
 
+    if let Some(idx_minus_one) = idx_minus_one {
+        Text::with_baseline(idx_minus_one.file_name().to_str().unwrap(), draw::TOP_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+    }
     if let Some(current_idx) = current_idx {
         Text::with_baseline(current_idx.file_name().to_str().unwrap(), draw::MIDDLE_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
@@ -1032,8 +1079,8 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                     draw_modal(&mut mapped, width, height, &message, options);
                 },
         // current dir, 
-                DrawCommand::NavigatingBackground { current_dir, file_count } => {
-                    draw_nav_background(&mut mapped, width, height, current_dir, file_count);
+                DrawCommand::NavigatingBackground { current_dir, file_count, current_index } => {
+                    draw_nav_background(&mut mapped, width, height, current_dir, file_count, current_index);
                 }
                 DrawCommand::RawFrame { data } => {
                     draw_raw_frame(&mut mapped, &data);
@@ -1068,6 +1115,12 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                     else {
                         clear_i2c_screen(&mut i2c_screen2_display);
                     }
+                }
+                DrawCommand::SelectNo => {
+                    select_no(&mut mapped, width, height);
+                }
+                DrawCommand::SelectYes => {
+                    select_yes(&mut mapped, width, height);
                 }
                 _ => ()
                 // DrawCommand::DrawI2CText { content, position, undraw } => {

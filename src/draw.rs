@@ -17,6 +17,13 @@ pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(60, 106);
 pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(60, 156);
 pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);
 
+// modal
+// no opt
+pub const MODAL_NO_BORDER_COORDS: Point = Point::new(110, 160);
+// yes opt
+pub const MODAL_YES_BORDER_COORDS: Point = Point::new(170, 160);
+
+
 // i2c screen 128x32 ssd1306 I think
 pub const DISPLAYSTATE_COORDS: Point = Point::new(0, 0);
 pub const TOP_MEDIA_TIMESTAMP_COORDS: Point = Point::new(0, 0);
