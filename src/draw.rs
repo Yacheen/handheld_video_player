@@ -13,6 +13,11 @@ pub const TOP_CAROUSEL_BG_COORDS: Point = Point::new(50, 90);
 pub const MIDDLE_CAROUSEL_BG_COORDS: Point = Point::new(50, 140);
 pub const BOTTOM_CAROUSEL_BG_COORDS: Point = Point::new(50, 190);
 
+// carousel icons
+pub const TOP_CAROUSEL_ICON_COORDS: Point = Point::new(10, 90);
+pub const MIDDLE_CAROUSEL_ICON_COORDS: Point = Point::new(10, 140);
+pub const BOTTOM_CAROUSEL_ICON_COORDS: Point = Point::new(10, 190);
+
 pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(60, 106);
 pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(60, 156);
 pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);

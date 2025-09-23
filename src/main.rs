@@ -149,12 +149,12 @@ async fn main() -> ! {
 
     // buttons channels and tasks-------------------------------------------------------------
     // btn channel
-    let (btn_tx, mut btn_rx) = mpsc::channel(32);
+    let (btn_tx, mut btn_rx) = mpsc::channel(128);
     // draw channel
-    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(32);
-    let (i2c_draw_tx, mut i2c_draw_rx) = mpsc::channel::<DrawCommand>(32);
+    let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(128);
+    let (i2c_draw_tx, mut i2c_draw_rx) = mpsc::channel::<DrawCommand>(128);
     // video/music task command channel (pause, resume, stop)
-    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(32);
+    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(128);
 
     let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
     // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
@@ -375,46 +375,20 @@ async fn main() -> ! {
                                 draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                             }
                             else if modal_state.selected == 1 {
-                                println!("hello world");
                                 let draw_tx = draw_tx.clone();
                                 let current_state = state.current_state.clone(); 
-                                let paused = state.video_state.paused.clone();
-                                let current_frame = state.video_state.current_frame.clone();
+                                state.video_state.paused.store(false, Ordering::Relaxed);
                                 {
                                     let mut current_state = current_state.lock().await;
                                     *current_state = DisplayState::PlayingSomething;
                                 }
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
-                                let paused = paused.clone();
                                 let draw_tx = draw_tx.clone();
                                 let file_details = modal_state.file.clone();
-                                let current_frame = current_frame.clone();
-                                tokio::spawn(async move {
-                                    if let Some(file_details) = file_details {
-                                        // 2 bytes per pixel btw
-                                        let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
-
-                                        // 24 fps
-                                        let frame_delay = Duration::from_millis(42);
-
-                                        // open bgr565le file
-                                        // start from current frame, so dball would be with an offset
-                                        let mut dball = File::open(file_details.file_path).unwrap();
-                                        let mut frame = vec![0u8; frame_bytes];
-
-                                        // start from current frame
-                                        while let Ok(()) = dball.read_exact(&mut frame) {
-                                            // break if paused
-                                            if paused.load(Ordering::Relaxed) == true {
-                                                break;
-                                            }
-                                            draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
-                                            tokio::time::sleep(frame_delay).await;
-                                            current_frame.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                });
+                                let paused = state.video_state.paused.clone();
+                                let current_frame = state.video_state.current_frame.clone();
+                                tokio::spawn(play_video(current_frame.clone(), paused.clone(), file_details, draw_tx.clone()));
                             }
                             modal_state.selected = 0;
                         }
@@ -444,17 +418,17 @@ async fn main() -> ! {
             DisplayState::PlayingSomething => {
                 match event {
                     ButtonEvent::Escape => {
-                        // set confirmingmediaexit state
+                        // set confirmingmediaexit state and set paused
+                        state.video_state.paused.store(true, Ordering::Relaxed);
                         {
                             let current_state = state.current_state.clone();
                             let mut current_state = current_state.lock().await;
                             *current_state = DisplayState::ConfirmingMediaExit;
                         }
+                        // there should always be a modal state at this point (file is set during
+                        // confirmmediaselection)
                         if let Some(modal_state) = &mut state.modal_state {
                             modal_state.selected = 0;
-                        }
-                        else {
-                            state.modal_state = Some(ModalState { message: "Exit to navigation menu?".to_string(), selected: 0, file: None });
                         }
                         draw_tx.send(DrawCommand::ConfirmingBackground { message: format!("Exit to navigation menu?"), options: vec!["No!".to_string(), "Yes!".to_string()] }).await.unwrap();
                         draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
@@ -491,7 +465,6 @@ async fn main() -> ! {
                     ButtonEvent::CurrentFrameChanged => {
                         // draw timestamp to i2c display 2 at point 
 
-                        println!("THE CURRENT FRAME HAS CHANGED");
                         // let current_frame = state.video_state.current_frame.load(Ordering::Relaxed);
                         // undraw
                         draw_tx.send(DrawCommand::DrawI2CText { content: state.video_state.drawn_timestamp, position: draw::TOP_MEDIA_TIMESTAMP_COORDS, undraw: true, screen: true }).await.unwrap();
@@ -508,16 +481,42 @@ async fn main() -> ! {
             DisplayState::ConfirmingMediaExit => {
                 match event {
                     ButtonEvent::Escape => {
+                        println!("pressing esc in exit!");
                         // resume video TODO!()
                         if let Some(modal_state) = &mut state.modal_state {
+                            // resume video TODO!()
+                            state.video_state.paused.swap(false, Ordering::Relaxed);
+                            {
+                                let current_state = state.current_state.clone();
+                                let mut current_state = current_state.lock().await;
+                                *current_state = DisplayState::PlayingSomething;
+                            }
                             modal_state.selected = 0;
+                            draw_tx.send(DrawCommand::DrawI2CText { content: "Exit media?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                            draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+
+                            tokio::spawn(play_video(state.video_state.current_frame.clone(), state.video_state.paused.clone(), modal_state.file.clone(), draw_tx.clone()));
+                            // draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                         }
                     }
                     ButtonEvent::Select => {
+                        println!("pressing select in exit!");
                         // set current state to either navigating or playingmedia
                         if let Some(modal_state) = &mut state.modal_state {
                             if modal_state.selected == 0 {
                                 // resume video TODO!()
+                                {
+                                    let current_state = state.current_state.clone();
+                                    let mut current_state = current_state.lock().await;
+                                    *current_state = DisplayState::PlayingSomething;
+                                }
+                                state.video_state.paused.swap(false, Ordering::Relaxed);
+                                modal_state.selected = 0;
+                                draw_tx.send(DrawCommand::DrawI2CText { content: "Exit media?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
+                                draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
+
+                                tokio::spawn(play_video(state.video_state.current_frame.clone(), state.video_state.paused.clone(), modal_state.file.clone(), draw_tx.clone()));
+                                // draw_tx.send(DrawCommand::NavigatingBackground { current_dir: state.nav_state.current_dir.clone(), file_count: state.nav_state.file_count, current_index: state.nav_state.current_index }).await.unwrap();
                             }
                             else if modal_state.selected == 1 {
                                 // go back to navigation
@@ -534,6 +533,7 @@ async fn main() -> ! {
                         }
                     }
                     ButtonEvent::Up => {
+                        println!("pressing up in exit!");
                         // invert state
                         if let Some(modal_state) = &mut state.modal_state {
                             modal_state.selected = 0;
@@ -541,6 +541,7 @@ async fn main() -> ! {
                         }
                     }
                     ButtonEvent::Down => {
+                        println!("pressing down in exit!");
                         // invert state
                         if let Some(modal_state) = &mut state.modal_state {
                             modal_state.selected = 1;
@@ -554,7 +555,10 @@ async fn main() -> ! {
                             *current_time = new_current_local_time;
                         }
                     }
-                    ButtonEvent::CurrentFrameChanged => {}
+                    ButtonEvent::CurrentFrameChanged => {
+                        println!("frame changed in exit!");
+
+                    }
                     _ => ()
                 }
             }
@@ -662,7 +666,7 @@ async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<At
             // send timestamp changed
             if current_frame > 0 && current_frame % 24 == 0 && current_frame != total_frames {
                 tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
-                println!("CURRENT FRAME HAS CHANGED, SENDING FROM THE TASk");
+                println!("frame changed");
             }
             tokio::time::sleep(Duration::from_millis(42)).await;
         }
@@ -965,7 +969,35 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: 
     let current_idx = readdir.get(current_index);
     let idx_plus_one = readdir.get(current_index + 1);
 
+    // icons
+    // each icon is 20widthx24height
+    // 20 x 24 x 2
+    // 960bytes total
+    // let folder_icon = &[u8; 960];
+    let folder_icon_file = std::fs::read("./filtype_ocons/folder_icon.rgb").unwrap();
+    let video_icon_file = std::fs::read("./filtype_ocons/video_icon.rgb").unwrap();
+    let questionmark_icon_file = std::fs::read("./filtype_ocons/questionmark_icon.rgb").unwrap();
+    let txtfile_icon_file = std::fs::read("./filtype_ocons/txtfile_icon.rgb").unwrap();
+
     if let Some(idx_minus_one) = idx_minus_one {
+        // if let Ok(file_type) = idx_minus_one.file_type() {
+        //     if file_type.is_dir() {
+        //         // draw folder_icon
+        //     }
+        //     else {
+        //         match extension {
+        //             ".txt" | ".bashrc"| ".rs" | ".sh" => {
+        //                 // draw txt icon
+        //             },
+        //             ".rgb" | ".raw" | ".rgb565" | ".mp4" => {
+        //                 // draw video icon
+        //             },
+        //             _ => {
+        //                 // draw questionmark icon
+        //             }
+        //         }
+        //     }
+        // }
         Text::with_baseline(idx_minus_one.file_name().to_str().unwrap(), draw::TOP_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
@@ -1423,5 +1455,33 @@ async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>
     Some((new_path, file_count))
 }
 
+async fn play_video(current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>, file_details: Option<FileDetails>, draw_tx: mpsc::Sender<DrawCommand>) {
+    if let Some(file_details) = file_details {
+        // 2 bytes per pixel btw
+        let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
+
+        // 24 fps
+        let frame_delay = Duration::from_millis(42);
+
+        let start_from = frame_bytes * current_frame.load(Ordering::Relaxed) as usize;
+
+        // open bgr565le file
+        // start from current frame, so dball would be with an offset
+        let mut video_file = File::open(file_details.file_path).unwrap();
+        let mut frame = vec![0u8; frame_bytes];
+        video_file.seek(std::io::SeekFrom::Start(start_from as u64)).unwrap();
+
+        // start from current frame
+        while let Ok(()) = video_file.read_exact(&mut frame) {
+            // break if paused
+            if paused.load(Ordering::Relaxed) == true {
+                break;
+            }
+            draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+            tokio::time::sleep(frame_delay).await;
+            current_frame.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 
