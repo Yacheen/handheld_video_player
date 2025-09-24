@@ -1008,12 +1008,15 @@ fn determine_icon_to_draw(direntry: &DirEntry) -> IconKind {
         else {
             // not a dir, can only be a file with/without an extension. .bashrc doesnt have an ext.
             if let Some(extension) = direntry.path().extension() {
+                if let Some(ext) = extension.to_str() {
+                    println!("extension: {}", ext);
+                }
                 match  extension.to_str().unwrap() {
-                    ".txt" | ".bashrc"| ".rs" | ".sh" => {
+                    "txt" | "bashrc" | "rs" | "sh" => {
                         // draw txt icon
                         IconKind::Txt
                     },
-                    ".rgb" | ".raw" | ".rgb565" | ".mp4" => {
+                    "rgb" | "raw" | "rgb565" | "mp4" => {
                         // draw video icon
                         IconKind::Video
                     },
