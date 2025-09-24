@@ -1,12 +1,12 @@
 use chrono::{DateTime, Local};
 use embedded_graphics::{
-    mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyle, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle}, text::{Baseline, Text}
+    image::{Image, ImageRaw, ImageRawLE}, mono_font::{ascii::{FONT_6X10, FONT_8X13}, MonoTextStyle, MonoTextStyleBuilder}, pixelcolor::{BinaryColor, Rgb565}, prelude::*, primitives::{PrimitiveStyleBuilder, Rectangle, RoundedRectangle}, text::{Baseline, Text}
 };
 use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::{gpio_cdev::{AsyncLineEventHandle, Chip, EventRequestFlags, EventType, LineRequestFlags}, I2cdev};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::{collections::HashMap, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
+use std::{collections::HashMap, fs::DirEntry, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
 use std::fs::File;
 use std::thread;
 use linuxfb::Framebuffer;
@@ -15,6 +15,8 @@ use tokio::{sync::mpsc, time::{sleep, Duration, Instant}};
 use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
+
+use crate::draw::{BOTTOM_CAROUSEL_ICON_COORDS, MIDDLE_CAROUSEL_ICON_COORDS, TOP_CAROUSEL_ICON_COORDS};
 
 
 const WIDTH: usize = 320;
@@ -153,8 +155,8 @@ async fn main() -> ! {
     // draw channel
     let (draw_tx, mut draw_rx) = mpsc::channel::<DrawCommand>(128);
     let (i2c_draw_tx, mut i2c_draw_rx) = mpsc::channel::<DrawCommand>(128);
-    // video/music task command channel (pause, resume, stop)
-    let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(128);
+    // video/music task command channel (pause, resume, stop), prob wont use anymore
+    // let (media_tx, mut media_rx) = mpsc::channel::<ControlCommand>(128);
 
     let file_count = std::fs::read_dir(std::env::current_dir().unwrap().as_path()).unwrap().count();
     // this'll give you: 2069-01-24 13:17:44.609871 UTC or something.
@@ -748,12 +750,17 @@ enum DrawCommand {
     ClearI2CScreen(bool),
     SelectYes,
     SelectNo,
+    DrawIcon {
+        point: Point,
+        kind: IconKind,
+        undraw: bool,
+    }
 }
-// to be used for video/music playback me thinks
-enum ControlCommand {
-    Stop,
-    Pause,
-    Resume,
+enum IconKind {
+    Txt,
+    Video,
+    Folder,
+    Questionmark
 }
 // light background, dark text
 fn draw_modal(fb: &mut [u8], width: usize, height: usize, msg: &str, options: Vec<String>) {
@@ -969,58 +976,107 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: 
     let current_idx = readdir.get(current_index);
     let idx_plus_one = readdir.get(current_index + 1);
 
-    // icons
-    // each icon is 20widthx24height
-    // 20 x 24 x 2
-    // 960bytes total
-    // let folder_icon = &[u8; 960];
-    let folder_icon_file = std::fs::read("./filtype_ocons/folder_icon.rgb").unwrap();
-    let video_icon_file = std::fs::read("./filtype_ocons/video_icon.rgb").unwrap();
-    let questionmark_icon_file = std::fs::read("./filtype_ocons/questionmark_icon.rgb").unwrap();
-    let txtfile_icon_file = std::fs::read("./filtype_ocons/txtfile_icon.rgb").unwrap();
 
     if let Some(idx_minus_one) = idx_minus_one {
-        // if let Ok(file_type) = idx_minus_one.file_type() {
-        //     if file_type.is_dir() {
-        //         // draw folder_icon
-        //     }
-        //     else {
-        //         match extension {
-        //             ".txt" | ".bashrc"| ".rs" | ".sh" => {
-        //                 // draw txt icon
-        //             },
-        //             ".rgb" | ".raw" | ".rgb565" | ".mp4" => {
-        //                 // draw video icon
-        //             },
-        //             _ => {
-        //                 // draw questionmark icon
-        //             }
-        //         }
-        //     }
-        // }
+        let kind = determine_icon_to_draw(idx_minus_one);
+        draw_icon(TOP_CAROUSEL_ICON_COORDS, &mut display, kind);
         Text::with_baseline(idx_minus_one.file_name().to_str().unwrap(), draw::TOP_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
     }
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        draw_icon(MIDDLE_CAROUSEL_ICON_COORDS, &mut display, kind);
         Text::with_baseline(current_idx.file_name().to_str().unwrap(), draw::MIDDLE_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
+        let kind = determine_icon_to_draw(idx_plus_one);
+        draw_icon(BOTTOM_CAROUSEL_ICON_COORDS, &mut display, kind);
         Text::with_baseline(idx_plus_one.file_name().to_str().unwrap(), draw::BOTTOM_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
     }
+}
+fn determine_icon_to_draw(direntry: &DirEntry) -> IconKind {
+    if let Ok(file_type) = direntry.file_type() {
+        if file_type.is_dir() {
+            // draw folder_icon
+            IconKind::Folder
+        }
+        else {
+            // not a dir, can only be a file with/without an extension. .bashrc doesnt have an ext.
+            if let Some(extension) = direntry.path().extension() {
+                match  extension.to_str().unwrap() {
+                    ".txt" | ".bashrc"| ".rs" | ".sh" => {
+                        // draw txt icon
+                        IconKind::Txt
+                    },
+                    ".rgb" | ".raw" | ".rgb565" | ".mp4" => {
+                        // draw video icon
+                        IconKind::Video
+                    },
+                    _ => {
+                        // draw questionmark icon
+                        IconKind::Questionmark
+                    }
+                }
+            }
+            else {
+                // draw questionmark icon
+                IconKind::Questionmark
+            }
+        }
+    }
+    else {
+        // draw questionmark icon
+        IconKind::Questionmark
+    }
 
-    // THESE ALL SHOULD PROBABLY BE HAND DRAWN, GPT5 CANT DRAW ICONS FOR SHIT LOL
-    // draw::draw_camera(fb, width, height, Point::new(40, 100));
-    // draw::draw_file(fb, width, height, Point::new(65, 100));
-    // draw::draw_paused(fb, width, height, Point::new(80, 100));
-    // draw::draw_volume(fb, width, height, Point::new(105, 100));
-    // draw::draw_playing(fb, width, height, Point::new(130, 100));
-    // draw::draw_question_mark(fb, width, height, Point::new(155, 100));
+}
+fn draw_icon(point: Point, display: &mut FramebufferDisplay, kind: IconKind) {
+    // icons
+    // each icon is 20widthx24height
+    // 20height x 24width x 2
+    // 960bytes total
+    // .. I think
+    let folder_icon_file = std::fs::read("/home/yassin/cross_compiled/filetype_icons/folder_icon.rgb").unwrap();
+    let video_icon_file = std::fs::read("/home/yassin/cross_compiled/filetype_icons/video_icon.rgb").unwrap();
+    let questionmark_icon_file = std::fs::read("/home/yassin/cross_compiled/filetype_icons/questionmark_icon.rgb").unwrap();
+    let txtfile_icon_file = std::fs::read("/home/yassin/cross_compiled/filetype_icons/txtfile_icon.rgb").unwrap();
+    match kind {
+        IconKind::Folder => {
+            let raw: ImageRawLE<Rgb565> = ImageRaw::new(&folder_icon_file, 24);
+            let image = Image::new(&raw, point);
+            image.draw(display).unwrap();
+        }
+        IconKind::Video => {
+            let raw: ImageRawLE<Rgb565> = ImageRaw::new(&video_icon_file, 24);
+            let image = Image::new(&raw, point);
+            image.draw(display).unwrap();
+        }
+        IconKind::Txt => {
+            let raw: ImageRawLE<Rgb565> = ImageRaw::new(&txtfile_icon_file, 24);
+            let image = Image::new(&raw, point);
+            image.draw(display).unwrap();
+        }
+        IconKind::Questionmark => {
+            let raw: ImageRawLE<Rgb565> = ImageRaw::new(&questionmark_icon_file, 24);
+            let image = Image::new(&raw, point);
+            image.draw(display).unwrap();
+        }
+    }
+}
+fn undraw_icon(point: Point, display: &mut FramebufferDisplay) {
+    let style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::CSS_DARK_GRAY)
+        .build();
 
+    Rectangle::new(point, Size::new(24, 20))
+        .into_styled(style)
+        .draw(display)
+        .unwrap();
 }
 fn undraw_nav_background(fb: &mut [u8], width: usize, height: usize, msg: &str, point: Point) {
     // undraw when leaving navigating state
@@ -1197,6 +1253,15 @@ async fn start_drawing_task(mut draw_rx: mpsc::Receiver<DrawCommand>) {
                 DrawCommand::SelectYes => {
                     select_yes(&mut mapped, width, height);
                 }
+                DrawCommand::DrawIcon { point, kind, undraw } => {
+                    let mut display = FramebufferDisplay { buf: &mut mapped, width, height };
+                    if undraw {
+                        undraw_icon(point, &mut display);
+                    }
+                    else {
+                        draw_icon(point, &mut display, kind);
+                    }
+                }
                 _ => ()
                 // DrawCommand::DrawI2CText { content, position, undraw } => {
                 //     if undraw {
@@ -1260,23 +1325,35 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
 
     // undraw based on indexes available
     if let Some(idx_minus_one) = idx_minus_one {
+        let kind = determine_icon_to_draw(idx_minus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
+        let kind = determine_icon_to_draw(idx_plus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
 
     // draw indexes based on new upcoming states
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_minus_one) = idx_minus_one {
+        let kind = determine_icon_to_draw(idx_minus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(idx_minus_two) = idx_minus_two {
+        let kind = determine_icon_to_draw(idx_minus_two);
+        draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_two.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
 
@@ -1294,23 +1371,35 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
 
     // undraw based on indexes available
     if let Some(idx_plus_one) = idx_plus_one {
+        let kind = determine_icon_to_draw(idx_plus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_minus_one) = idx_minus_one {
+        let kind = determine_icon_to_draw(idx_minus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
 
     // draw indexes based on new upcoming states
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
+        let kind = determine_icon_to_draw(idx_plus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(idx_plus_two) = idx_plus_two {
+        let kind = determine_icon_to_draw(idx_plus_two);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_two.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", nav_state.current_index + 1, nav_state.file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: true, is_selected: false,}).await.unwrap();
