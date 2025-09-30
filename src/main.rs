@@ -6,7 +6,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use linux_embedded_hal::{gpio_cdev::{AsyncLineEventHandle, Chip, EventRequestFlags, EventType, LineRequestFlags}, I2cdev};
 use linux_embedded_hal::i2cdev::core::I2CDevice;
 use linux_embedded_hal::{ CdevPin };
-use std::{collections::HashMap, fs::DirEntry, io::prelude::*, os::unix::ffi::OsStringExt, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
+use std::{collections::HashMap, fs::DirEntry, io::prelude::*, os::unix::{ffi::OsStringExt, fs::MetadataExt}, path::PathBuf, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
 use std::fs::File;
 use std::thread;
 use linuxfb::Framebuffer;
@@ -16,7 +16,7 @@ use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
 
-use crate::draw::{BOTTOM_CAROUSEL_ICON_COORDS, MIDDLE_CAROUSEL_ICON_COORDS, TOP_CAROUSEL_ICON_COORDS};
+use crate::draw::{BOTTOM_CAROUSEL_ICON_COORDS, ENTRY_META_FILESIZE_TEXT_COORDS, MIDDLE_CAROUSEL_ICON_COORDS, TOP_CAROUSEL_ICON_COORDS};
 
 
 const WIDTH: usize = 320;
@@ -69,6 +69,8 @@ struct FileDetails {
     file_size: u64,
     file_name: String,
     file_extension: String,
+    is_dir: bool,
+    last_modified: String,
 }
 struct NavigatingData {
     current_dir: PathBuf,
@@ -247,14 +249,14 @@ async fn main() -> ! {
                         println!("Clicked Select!");
                         let res = enter_dir_or_select_file(&state.nav_state, draw_tx.clone()).await;
                         match res {
-                            SelectResponse::File { file_name, file_size, file_extension, file_path } => {
+                            SelectResponse::File { file_name, file_size, file_extension, file_path, last_modified } => {
                                 println!("this file extension is: {}", file_extension);
                                 println!("file size: {}", file_size);
                                 println!("file name: {}", file_name);
                                 let draw_tx = draw_tx.clone();
                                 match file_extension.as_str() {
                                     "rgb565" | "raw" => {
-                                        state.modal_state = Some(ModalState { message: format!("Play video: {}?", file_name), selected: 0, file: Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone() })});
+                                        state.modal_state = Some(ModalState { message: format!("Play video: {}?", file_name), selected: 0, file: Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone(), is_dir: false, last_modified })});
                                         state.video_state.total_frames.swap(file_size, Ordering::Relaxed);
                                         {
                                             let current_state = state.current_state.clone();
@@ -266,7 +268,7 @@ async fn main() -> ! {
                                         draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
                                     }
                                     _ =>  {
-                                        state.modal_state = Some(ModalState { message: "Can not currently play this kind of file - handling of different files (such as txt's, and other basic formats) are in development!".to_string(), selected: 0, file:Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone() })});
+                                        state.modal_state = Some(ModalState { message: "Can not currently play this kind of file - handling of different files (such as txt's, and other basic formats) are in development!".to_string(), selected: 0, file:Some(FileDetails { file_path, file_size, file_name: file_name.clone(), file_extension: file_extension.clone(), last_modified, is_dir: false })});
                                         {
                                             let current_state = state.current_state.clone();
                                             let mut current_state = current_state.lock().await;
@@ -278,7 +280,7 @@ async fn main() -> ! {
                                     }
                                 }
                             }
-                            SelectResponse::Directory { file_path, file_count } => {
+                            SelectResponse::Directory { file_path, file_count, last_modified } => {
                                 state.nav_state.current_dir = file_path;
                                 state.nav_state.current_index = 0;
                                 state.nav_state.file_count = file_count;
@@ -987,6 +989,25 @@ fn draw_nav_background(fb: &mut [u8], width: usize, height: usize, current_dir: 
     if let Some(current_idx) = current_idx {
         let kind = determine_icon_to_draw(current_idx);
         draw_icon(MIDDLE_CAROUSEL_ICON_COORDS, &mut display, kind);
+        // file size, 
+        Text::with_baseline("Size", draw::ENTRY_META_FILESIZE_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline(&utils::format_bytes(current_idx.metadata().unwrap().size()), draw::ENTRY_META_FILESIZE_TEXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        // last_modified
+        let mtime = current_idx.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        Text::with_baseline("Last modified", draw::ENTRY_META_LASTMODIFIED_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+        Text::with_baseline(&last_modified, draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, txt_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+        // selected file name
         Text::with_baseline(current_idx.file_name().to_str().unwrap(), draw::MIDDLE_CAROUSEL_TXT_COORDS, txt_style, Baseline::Top)
             .draw(&mut display)
             .unwrap();
@@ -1334,7 +1355,16 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
     }
     if let Some(current_idx) = current_idx {
         let kind = determine_icon_to_draw(current_idx);
+        let mtime = current_idx.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+        // icon
         draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
+        // file name
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_plus_one) = idx_plus_one {
@@ -1351,6 +1381,13 @@ async fn scroll_up(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand
     }
     if let Some(idx_minus_one) = idx_minus_one {
         let kind = determine_icon_to_draw(idx_minus_one);
+        let mtime = idx_minus_one.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(idx_minus_one.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
         draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
@@ -1380,6 +1417,13 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
     }
     if let Some(current_idx) = current_idx {
         let kind = determine_icon_to_draw(current_idx);
+        let mtime = current_idx.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
         draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
@@ -1397,6 +1441,13 @@ async fn scroll_down(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawComma
     }
     if let Some(idx_plus_one) = idx_plus_one {
         let kind = determine_icon_to_draw(idx_plus_one);
+        let mtime = idx_plus_one.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(idx_plus_one.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
         draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
@@ -1415,10 +1466,12 @@ enum SelectResponse {
         file_size: u64,
         file_extension: String,
         file_path: PathBuf,
+        last_modified: String,
     },
     Directory{
         file_path: PathBuf,
         file_count: usize,
+        last_modified: String,
     },
     Error(String),
     FatalError(String),
@@ -1440,12 +1493,25 @@ async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sen
 
                 // undraw possible idx_plus_one, current_idx, and idx_minus_one
                 if let Some(idx_plus_one) = idx_plus_one {
+                    let kind = determine_icon_to_draw(idx_plus_one);
+                    draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
                     draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
                 }
                 if let Some(current_idx) = current_idx {
+                    let kind = determine_icon_to_draw(current_idx);
+                    let mtime = current_idx.metadata().unwrap().mtime();
+                    let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+                    let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+                    // file size, 
+                    draw_tx.send(DrawCommand::Text { content: utils::format_bytes(current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+                    // last modified
+                    draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+                    draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
                     draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
                 }
                 if let Some(idx_minus_one) = idx_minus_one {
+                    let kind = determine_icon_to_draw(idx_minus_one);
+                    draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
                     draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
                 }
 
@@ -1461,13 +1527,27 @@ async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sen
                     draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 1, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
                 }
                 if let Some(new_idx_plus_one) = new_idx_plus_one {
+                    let kind = determine_icon_to_draw(new_idx_plus_one);
+                    draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
                     draw_tx.send(DrawCommand::Text { content: new_idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
                 }
                 if let Some(new_current_idx) = new_current_idx {
+                    let kind = determine_icon_to_draw(new_current_idx);
+                    let mtime = new_current_idx.metadata().unwrap().mtime();
+                    let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+                    let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+                    // file size, 
+                    draw_tx.send(DrawCommand::Text { content: utils::format_bytes(new_current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+                    // last modified
+                    draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+                    draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
                     draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
                 }
                 draw_tx.send(DrawCommand::Text { content: format_dir(entry.path().to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();
-                SelectResponse::Directory { file_path: entry.path(), file_count: file_count } 
+                let mtime = entry.metadata().unwrap().mtime();
+                let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+                let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+                SelectResponse::Directory { file_path: entry.path(), file_count: file_count, last_modified } 
             }
             else if meta.is_file() {
                 // check extension
@@ -1478,7 +1558,10 @@ async fn enter_dir_or_select_file(nav_state: &NavigatingData, draw_tx: mpsc::Sen
                 let path = entry.path();
                 let file_extension = path.extension();
                 if let Some(file_extension) = file_extension {
-                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len(), file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path }
+                    let mtime = entry.metadata().unwrap().mtime();
+                    let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+                    let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+                    SelectResponse::File { file_name: entry.file_name().to_str().unwrap().to_owned(), file_size: meta.len(), file_extension: file_extension.to_str().unwrap().to_owned(), file_path: path, last_modified }
                 }
                 else {
                     SelectResponse::Error(String::from("Filetype error: File can not be opened, must be either a .mp3, rgb565, or .raw file."))
@@ -1513,12 +1596,25 @@ async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>
     draw_tx.send(DrawCommand::Text { content: format_dir(nav_state.current_dir.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     // if there are files or dirs, undraw them
     if let Some(idx_plus_one) = idx_plus_one {
+        let kind = determine_icon_to_draw(idx_plus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
     if let Some(current_idx) = current_idx {
+        let kind = determine_icon_to_draw(current_idx);
+        let mtime = current_idx.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: true, is_selected: true }).await.unwrap();
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: true, is_selected: true,}).await.unwrap();
     }
     if let Some(idx_minus_one) = idx_minus_one {
+        let kind = determine_icon_to_draw(idx_minus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: TOP_CAROUSEL_ICON_COORDS, kind, undraw: true }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: idx_minus_one.file_name().to_str().unwrap().to_owned(), position: draw::TOP_CAROUSEL_TXT_COORDS, undraw: true, is_selected: false,}).await.unwrap();
     }
 
@@ -1538,9 +1634,20 @@ async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>
         draw_tx.send(DrawCommand::Text { content: format!("{}/{}", 1, file_count), position: draw::TOP_NAV_FILE_INDEX_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(new_idx_plus_one) = new_idx_plus_one {
+        let kind = determine_icon_to_draw(new_idx_plus_one);
+        draw_tx.send(DrawCommand::DrawIcon { point: BOTTOM_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: new_idx_plus_one.file_name().to_str().unwrap().to_owned(), position: draw::BOTTOM_CAROUSEL_TXT_COORDS, undraw: false, is_selected: false,}).await.unwrap();
     }
     if let Some(new_current_idx) = new_current_idx {
+        let kind = determine_icon_to_draw(new_current_idx);
+        let mtime = new_current_idx.metadata().unwrap().mtime();
+        let unformatted_last_modified = DateTime::from_timestamp(mtime, 0).unwrap().naive_local();
+        let last_modified = unformatted_last_modified.format("%m-%d-%Y, %-I:%M%P").to_string();
+        // file size, 
+        draw_tx.send(DrawCommand::Text { content: utils::format_bytes(new_current_idx.metadata().unwrap().size()), position: ENTRY_META_FILESIZE_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+        // last modified
+        draw_tx.send(DrawCommand::Text { content: last_modified, position: draw::ENTRY_META_LASTMODIFIED_TEXT_COORDS, undraw: false, is_selected: true }).await.unwrap();
+        draw_tx.send(DrawCommand::DrawIcon { point: MIDDLE_CAROUSEL_ICON_COORDS, kind, undraw: false }).await.unwrap();
         draw_tx.send(DrawCommand::Text { content: new_current_idx.file_name().to_str().unwrap().to_owned(), position: draw::MIDDLE_CAROUSEL_TXT_COORDS, undraw: false, is_selected: true,}).await.unwrap();
     }
     draw_tx.send(DrawCommand::Text { content: format_dir(new_path.to_owned()), position: draw::TOP_NAV_PATH_COORDS, undraw: false, is_selected: false,}).await.unwrap();

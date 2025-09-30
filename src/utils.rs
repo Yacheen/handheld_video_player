@@ -24,3 +24,15 @@ pub fn format_timecode(current_frames: u64, total_frames: u64, fps: u64) -> Stri
         )
     }
 }
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    match bytes {
+        bytes if bytes >= GB => format!("{}GB", bytes / GB),
+        bytes if bytes >= MB => format!("{}MB", bytes / MB),
+        bytes if bytes >= KB => format!("{}KB", bytes / KB),
+        _ => format!("{}B", bytes)
+    }
+}

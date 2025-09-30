@@ -18,6 +18,12 @@ pub const TOP_CAROUSEL_ICON_COORDS: Point = Point::new(10, 90);
 pub const MIDDLE_CAROUSEL_ICON_COORDS: Point = Point::new(10, 140);
 pub const BOTTOM_CAROUSEL_ICON_COORDS: Point = Point::new(10, 190);
 
+// file_size, last_modified text - goes between nav_bar and carousel container
+pub const ENTRY_META_FILESIZE_COORDS: Point = Point::new(40, 60);
+pub const ENTRY_META_FILESIZE_TEXT_COORDS: Point = Point::new(40, 70);
+pub const ENTRY_META_LASTMODIFIED_COORDS: Point = Point::new(120, 60);
+pub const ENTRY_META_LASTMODIFIED_TEXT_COORDS: Point = Point::new(120, 70);
+
 pub const TOP_CAROUSEL_TXT_COORDS: Point = Point::new(60, 106);
 pub const MIDDLE_CAROUSEL_TXT_COORDS: Point = Point::new(60, 156);
 pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);
@@ -27,6 +33,9 @@ pub const BOTTOM_CAROUSEL_TXT_COORDS: Point = Point::new(60, 206);
 pub const MODAL_NO_BORDER_COORDS: Point = Point::new(110, 160);
 // yes opt
 pub const MODAL_YES_BORDER_COORDS: Point = Point::new(170, 160);
+// places to change screen:
+// scroll up, scroll down, enter_dir_or_select_response, exit_dir, draw_nav_background
+// IMPORTANT: undraws should be of whatever the last current_idx was b4 changing
 
 
 // i2c screen 128x32 ssd1306 I think
