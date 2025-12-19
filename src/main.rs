@@ -78,7 +78,7 @@ struct NavigatingData {
     file_count: usize,
 }
 struct PlayingSomethingData {
-    paused: Arc<AtomicBool>,
+    paused: Arc<tokio::sync::Mutex<bool>>,
     // framerate is 24fps, so for example, frame 480 would be 20 seconds into the video
     current_frame: Arc<AtomicU64>,
     volume: Arc<AtomicU64>,
@@ -178,7 +178,7 @@ async fn main() -> ! {
             current_index: 0,
         },
         video_state: PlayingSomethingData {
-            paused: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(tokio::sync::Mutex::new(false)),
             current_frame: Arc::new(AtomicU64::new(0)),
             total_frames: Arc::new(AtomicU64::new(0)),
             volume: Arc::new(AtomicU64::new(0)),
@@ -381,9 +381,10 @@ async fn main() -> ! {
                             else if modal_state.selected == 1 {
                                 let draw_tx = draw_tx.clone();
                                 let current_state = state.current_state.clone(); 
-                                state.video_state.paused.store(false, Ordering::Relaxed);
                                 {
                                     let mut current_state = current_state.lock().await;
+                                    let mut paused = state.video_state.paused.lock().await;
+                                    *paused = false;
                                     *current_state = DisplayState::PlayingSomething;
                                 }
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Confirm?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
@@ -423,10 +424,11 @@ async fn main() -> ! {
                 match event {
                     ButtonEvent::Escape => {
                         // set confirmingmediaexit state and set paused
-                        state.video_state.paused.store(true, Ordering::Relaxed);
                         {
                             let current_state = state.current_state.clone();
                             let mut current_state = current_state.lock().await;
+                            let mut paused = state.video_state.paused.lock().await;
+                            *paused = true;
                             *current_state = DisplayState::ConfirmingMediaExit;
                         }
                         // there should always be a modal state at this point (file is set during
@@ -489,10 +491,11 @@ async fn main() -> ! {
                         // resume video TODO!()
                         if let Some(modal_state) = &mut state.modal_state {
                             // resume video TODO!()
-                            state.video_state.paused.swap(false, Ordering::Relaxed);
                             {
                                 let current_state = state.current_state.clone();
                                 let mut current_state = current_state.lock().await;
+                                let mut paused = state.video_state.paused.lock().await;
+                                *paused = false;
                                 *current_state = DisplayState::PlayingSomething;
                             }
                             modal_state.selected = 0;
@@ -512,9 +515,10 @@ async fn main() -> ! {
                                 {
                                     let current_state = state.current_state.clone();
                                     let mut current_state = current_state.lock().await;
+                                    let mut paused = state.video_state.paused.lock().await;
+                                    *paused = false;
                                     *current_state = DisplayState::PlayingSomething;
                                 }
-                                state.video_state.paused.swap(false, Ordering::Relaxed);
                                 modal_state.selected = 0;
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Exit media?".to_string(), position: Point::zero(), undraw: true, screen: false }).await.unwrap();
                                 draw_tx.send(DrawCommand::DrawI2CText { content: "Playing media!".to_string(), position: Point::zero(), undraw: false, screen: false }).await.unwrap();
@@ -661,19 +665,21 @@ async fn current_time_task(tx: mpsc::Sender<ButtonEvent>, state: Arc<Mutex<DateT
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, file_size: Arc<AtomicU64>, paused: Arc<AtomicBool>) {
+async fn current_frame_task(tx: mpsc::Sender<ButtonEvent>, current_frame: Arc<AtomicU64>, file_size: Arc<AtomicU64>, paused: Arc<tokio::sync::Mutex<bool>>) {
     loop {
-        let paused = paused.load(Ordering::Relaxed);
-        if !paused {
-            let current_frame = current_frame.load(Ordering::Relaxed);
-            let total_frames = file_size.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64;
-            // send timestamp changed
-            if current_frame > 0 && current_frame % 24 == 0 && current_frame != total_frames {
-                tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
-                println!("frame changed");
+        {
+            let paused = paused.lock().await;
+            if !*paused {
+                let current_frame = current_frame.load(Ordering::Relaxed);
+                let total_frames = file_size.load(Ordering::Relaxed) / PIXELS_PER_FRAME as u64;
+                // send timestamp changed
+                if current_frame > 0 && current_frame % 24 == 0 && current_frame != total_frames {
+                    tx.send(ButtonEvent::CurrentFrameChanged).await.unwrap();
+                    println!("frame changed");
+                }
             }
-            tokio::time::sleep(Duration::from_millis(42)).await;
         }
+        tokio::time::sleep(Duration::from_millis(42)).await;
     }
 }
 
@@ -1654,7 +1660,7 @@ async fn exit_dir(nav_state: &NavigatingData, draw_tx: mpsc::Sender<DrawCommand>
     Some((new_path, file_count))
 }
 
-async fn play_video(current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>, file_details: Option<FileDetails>, draw_tx: mpsc::Sender<DrawCommand>) {
+async fn play_video(current_frame: Arc<AtomicU64>, paused: Arc<tokio::sync::Mutex<bool>>, file_details: Option<FileDetails>, draw_tx: mpsc::Sender<DrawCommand>) {
     if let Some(file_details) = file_details {
         // 2 bytes per pixel btw
         let frame_bytes = WIDTH as usize * HEIGHT as usize * 2;
@@ -1673,12 +1679,16 @@ async fn play_video(current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>, file
         // start from current frame
         while let Ok(()) = video_file.read_exact(&mut frame) {
             // break if paused
-            if paused.load(Ordering::Relaxed) == true {
-                break;
+            {
+                if *paused.lock().await == true {
+                    break;
+                }
+                else {
+                    draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
+                    current_frame.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            draw_tx.send(DrawCommand::RawFrame { data: frame.clone() }).await.unwrap();
             tokio::time::sleep(frame_delay).await;
-            current_frame.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
