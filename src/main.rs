@@ -16,6 +16,7 @@ use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd13
 use futures::StreamExt;
 use debouncr::{debounce_4, Debouncer, Edge, Repeat4};
 use std::process::Command;
+use openweathermap::{blocking::weather, init, update};
 
 use crate::draw::{BOTTOM_CAROUSEL_ICON_COORDS, ENTRY_META_FILESIZE_TEXT_COORDS, MIDDLE_CAROUSEL_ICON_COORDS, TOP_CAROUSEL_ICON_COORDS};
 
@@ -57,6 +58,7 @@ struct State {
     modal_state: Option<ModalState>,
     error_state: String,
     current_time: Arc<Mutex<DateTime<Local>>>,
+    current_weather: Arc<Mutex<String>>,
 }
 #[derive(Clone)]
 struct ModalState {
@@ -188,6 +190,7 @@ fn main() -> ! {
         modal_state: None,
         error_state: String::new(),
         current_time: Arc::new(Mutex::new(current_local_time)),
+        current_weather: Arc::new(Mutex::new(String::from("?"))),
     };
 
     // select
@@ -229,6 +232,15 @@ fn main() -> ! {
     // draw task - will draw whatever until end of program
     thread::spawn(|| {
         start_drawing_task(draw_rx);
+    });
+
+    // weather task - draws whenever weather changes if only in navigation state
+    let current_state1 = state.current_state.clone();
+    let current_weather1 = state.current_weather.clone();
+    let draw_tx1 = draw_tx.clone();
+    draw_tx.send(DrawCommand::Text { content: "?".to_string(), position: draw::TOP_NAV_WEATHER_TEXT_COORDS, undraw: false, is_selected: false,}).unwrap();
+    thread::spawn(move || {
+        current_weather_task(current_state1, current_weather1,draw_tx1);
     });
 
     // wait for tasks to be ready or something idk, maybe mostly drawing task to init i2c and spi
@@ -1727,6 +1739,42 @@ fn play_video(current_frame: Arc<AtomicU64>, paused: Arc<AtomicBool>, file_detai
                 }
             }
             thread::sleep(frame_delay);
+        }
+    }
+}
+fn current_weather_task(current_state: Arc<Mutex<DisplayState>>, current_weather: Arc<Mutex<String>>, draw_tx: mpsc::Sender<DrawCommand>) {
+    let weather_api_key = std::env::var("WEATHER_API_KEY");
+    match weather_api_key {
+        Ok(key) => {
+            loop {
+                match &weather("Edmonton,AB", "celcius", "en", &key) {
+                    Ok(current) => {
+                        let current_state = current_state.lock().unwrap();
+                        match *current_state {
+                            DisplayState::Navigating => {
+                                println!("Got the weather, it is {}", current.weather[0].main.to_string());
+                                let mut current_weather = current_weather.lock().unwrap();
+                                let new_weather_as_string = current.weather[0].main.to_string();
+                                // redraw current weather
+                                draw_tx.send(DrawCommand::Text { content: current_weather.clone(), position: draw::TOP_NAV_WEATHER_TEXT_COORDS, undraw: true, is_selected: false,}).unwrap();
+                                draw_tx.send(DrawCommand::Text { content: new_weather_as_string.clone(), position: draw::TOP_NAV_WEATHER_TEXT_COORDS, undraw: false, is_selected: false,}).unwrap();
+                                *current_weather = new_weather_as_string;
+                            }
+                            _ => (),
+                        }
+                    }
+                    Err(e) => {
+                        println!("Problem getting weather: {:#?}", e);
+                        let mut current_weather = current_weather.lock().unwrap();
+                        *current_weather = "?".to_string();
+                        draw_tx.send(DrawCommand::Text { content: "?".to_string(), position: draw::TOP_NAV_WEATHER_TEXT_COORDS, undraw: false, is_selected: false,}).unwrap();
+                    }
+                }
+                thread::sleep(Duration::from_mins(61));
+            }
+        }
+        Err(err) => {
+            println!("no weather api key means no weather.");
         }
     }
 }
